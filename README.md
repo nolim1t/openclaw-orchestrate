@@ -82,7 +82,21 @@ AGENT_ROSTER=seer,sentinel,judge
 PERSONALITY_PRESET=mystic
 ```
 
-### 3. Generate the stack
+### 3. Test before applying
+
+```bash
+make test
+```
+
+This runs the generator in a throwaway sandbox and validates every artifact — no changes to `~/.openclaw`. Then verify your dynamic roster works:
+
+```bash
+make test-roster
+```
+
+Both should pass green before you apply to the real state directory.
+
+### 4. Generate the stack
 
 ```bash
 make setup
@@ -90,7 +104,13 @@ make setup
 
 This reads your `.env`, auto-detects which optional features are enabled, and generates the entire `~/.openclaw/` tree — including agent directories, SOUL.md files, and Telegram routing — based on your roster and presets.
 
-### 4. Deploy with Docker
+Inspect what got created:
+
+```bash
+make agents
+```
+
+### 5. Deploy with Docker
 
 ```bash
 make docker-build
@@ -98,7 +118,7 @@ make docker-up
 make status
 ```
 
-### 5. Watch it run
+### 6. Watch it run
 
 ```bash
 make logs
@@ -108,19 +128,40 @@ make logs
 
 ## Make Targets
 
+### Setup & Testing
+
 | Target | What it does |
 |---|---|
-| `make init` | Create directory structure, fetch scripts, seed `.env` |
+| `make init` | Create directory structure, seed `.env` |
 | `make setup` | Run the generator with current env vars (re-runnable, idempotent) |
+| `make test` | Dry-run generator in throwaway sandbox, verify all artifacts |
+| `make test-roster` | End-to-end test of dynamic roster generation with custom overrides |
+| `make check` | Validate script syntax and generated config files |
+| `make agents` | Show current roster, themes, roles, models |
+
+### Docker
+
+| Target | What it does |
+|---|---|
 | `make docker-build` | Build the container image |
 | `make docker-up` | Start the triad |
 | `make docker-down` | Stop containers (state preserved) |
 | `make clean` | Remove containers + images (state preserved) |
-| `make wipe` | **DANGER** — removes all state (requires typed confirmation) |
+
+### Monitoring
+
+| Target | What it does |
+|---|---|
 | `make logs` | Follow container logs live |
 | `make logs-system` | Last 100 lines |
 | `make shell` | Bash into the running container |
 | `make status` | Show containers + state directory health |
+
+### Destructive
+
+| Target | What it does |
+|---|---|
+| `make wipe` | **DANGER** — removes all state (requires typed confirmation) |
 | `make help` | Full command reference |
 
 ---
@@ -195,6 +236,60 @@ AGENT_RISK_THINKING=high
 ```
 
 These populate directly into `openclaw.json`, SOUL.md, and AGENTS.md.
+
+---
+
+## Testing Before Live Deployment
+
+### `make test` — Full Dry Run
+
+Runs the generator against a disposable state directory using your real `.env` customization but a dummy API key. Validates:
+
+- Script syntax (`bash -n`)
+- Successful generator execution (captures stderr for inspection on failure)
+- All config files present: `openclaw.json`, `.env`, `.env.example`
+- `.env` has `600` permissions (secure)
+- `trading.json` parses as valid JSON and is locked to `"mode": "testnet"`
+- Every agent in roster has: workspace dir, all 4 identity files, config entry in `openclaw.json`
+- Runtime dirs under `agents/` created
+- Trade ledger and calibration archive initialized
+
+Sandbox location: `/tmp/openclaw-test-*` (auto-deleted on success, retained on failure for debugging)
+
+**When to use:** Before any change to your `.env`, before deploying to production, before sharing your setup.
+
+### `make test-roster` — Dynamic Roster Test
+
+Exercises the agent customization system end-to-end with a synthetic 4-agent roster:
+
+- Creates agents `alpha,beta,gamma,delta` with `quant` preset
+- Verifies per-agent model override lands in `openclaw.json`
+- Verifies per-agent theme override flows into SOUL.md
+- Verifies per-agent thinking override applies correctly
+- Confirms all 4 runtime dirs created
+
+**When to use:** When you've added new agents beyond the default triad, when adding new `AGENT_{NAME}_*` variables, when troubleshooting overrides not appearing.
+
+### Combined Workflow
+
+```bash
+# Initial setup
+make init
+make test && make test-roster   # Prove generator healthy
+
+# Customize your roster in .env
+nano ~/.openclaw/.env
+
+# Test your custom roster
+make test                       # Uses your actual .env roster
+make test-roster                # Tests dynamic system independently
+
+# Apply to real state
+make setup && make agents
+
+# Deploy
+make docker-build && make docker-up
+```
 
 ---
 
@@ -442,6 +537,20 @@ Regenerate everything else with `make setup`.
 
 ## Troubleshooting
 
+**`make test` fails with script syntax error**
+```bash
+bash -n scripts/setup-openclaw-triad.sh
+```
+Fix any reported issues, then re-run.
+
+**`make test` fails during generator execution**
+The sandbox is kept at `/tmp/openclaw-test-*`. Inspect:
+```bash
+ls /tmp/openclaw-test-*/
+cat /tmp/openclaw-test-*/stderr.log
+```
+Common causes: missing `NANOGPT_API_KEY`, invalid `AGENT_ROSTER` format, malformed env vars.
+
 **`docker compose` can't find the compose file**
 ```bash
 ls -la ~/.openclaw/docker-compose.yml
@@ -478,6 +587,12 @@ make setup
 # Restart container
 make docker-down && make docker-up
 ```
+
+**Custom agent overrides not appearing**
+Run `make test-roster` to confirm the dynamic roster system works. If it passes but your overrides don't appear:
+1. Check variable naming: `AGENT_{NAME_UPPERCASED}_{PROPERTY}`
+2. Check for spaces around commas in `AGENT_ROSTER`
+3. Run `make agents` to debug which values are loaded from `.env`
 
 ---
 
@@ -538,27 +653,9 @@ Reusability. The same orchestrator can now serve:
 
 Just change `AGENT_ROSTER` and `PERSONALITY_PRESET`. Everything else follows.
 
----
+**Why add explicit testing targets?**
 
-## Testing Before Live
-
-**Dry run syntax check:**
-```bash
-bash -n scripts/setup-openclaw-triad.sh
-```
-
-**Test with throwaway directory:**
-```bash
-export OPENCLAW_STATE_DIR=/tmp/openclaw-test
-./scripts/setup-openclaw-triad.sh --docker
-```
-
-**Verify generated files:**
-```bash
-cat ~/.openclaw/openclaw.json | jq .agents.entries  # Should show all agents
-cat ~/.openclaw/workspace-triad/*/SOUL.md           # Each agent has a soul
-cat ~/.openclaw/trading.json                        # Should say "testnet"
-```
+Trading infrastructure is unforgiving. A single typo in an API key or a broken agent reference shouldn't brick your deployment or leak funds. `make test` gives you confidence before touching production state, and `make test-roster` proves the customization system itself is sound.
 
 ---
 
@@ -574,4 +671,4 @@ Nothing here is financial advice. The risk limits encoded (5% max position, 15% 
 
 *Built for Nolimitus Maximus — Conscious Traveller / Raver*
 *Purpose: passive income funding exploration, not accumulation for its own sake*
-*Version: 2.0 with fully customizable agent rosters*
+*Version: 2.0 with fully customizable agent rosters + testing suite*
