@@ -4,17 +4,25 @@
 # Portable, parameterized OpenClaw triad workspace builder
 #
 # USAGE:
-#   ./setup-openclaw-triad.sh                        # Auto-detect features from env
-#   ./setup-openclaw-triad.sh --docker               # Also generate Docker config
-#   ./setup-openclaw-triad.sh --docker --wallet xmr  # Docker + Monero treasury
+#   ./setup-openclaw-triad.sh                        # Uses default triad
+#   ./setup-openclaw-triad.sh --docker               # Docker + default triad
+#   ./setup-openclaw-triad.sh --roster "oracle,risk,arbiter"  # Custom names
 #   ./setup-openclaw-triad.sh --state-dir /srv/openclaw
+#   ./setup-openclaw-triad.sh --personality "sassy"  # Personality preset
 #
 # PORTABILITY:
 #   - Every path derives from OPENCLAW_STATE_DIR (default ~/.openclaw)
 #   - Optional features activate only when their API keys are present
-#   - Docker compose paths are generated from the resolved state dir,
-#     then overridable at runtime via docker.env
+#   - Docker compose paths are generated from the resolved state dir
 #   - Whole tree is relocatable: tar it, move it, set env vars, run
+#
+# CUSTOMIZATION — Agent roster & personalities:
+#   AGENT_ROSTER           Comma-separated agent names (default: clawdia,clawdio,arbiter)
+#   AGENT_{name}_ROLE      Role description for each agent
+#   AGENT_{name}_THEME     Visual/personality theme (e.g. "purple holographic fox")
+#   AGENT_{name}_MODEL     Model override for specific agent
+#   AGENT_{name}_THINKING  Thinking depth: light|medium|high (default: medium)
+#   PERSONALITY_PRESET     Quick personality packs: default|bold|conservative|mystic
 #
 
 set -euo pipefail
@@ -36,10 +44,31 @@ CONTAINER_HOME="${CONTAINER_HOME:-/home/openclaw}"
 CONTAINER_STATE_DIR="${CONTAINER_STATE_DIR:-${CONTAINER_HOME}/.openclaw}"
 
 ##############################################################################
-# MODEL DEFAULTS (NanoGPT model IDs — override any of these)
+# CUSTOMIZABLE AGENT SYSTEM
 ##############################################################################
 
-CLAWDIA_MODEL="${CLAWDIA_MODEL:-anthropic/claude-sonnet-4-6}"
+# Default agent roster — easily overridden
+DEFAULT_AGENT_ROSTER="clawdia,clawdio,arbiter"
+AGENT_ROSTER="${AGENT_ROSTER:-$DEFAULT_AGENT_ROSTER}"
+
+# Personality presets — quick-start templates
+# Override any of these with individual AGENT_{name}_* vars
+declare -A PERSONALITY_PRESETS=(
+    [default]="sassy oracle|steady guardian|wise mediator"
+    [bold]="reckless visionary|impulse trader|momentum hunter"
+    [conservative]="risk sentinel|capital warden|loss avenger"
+    [mystic]="intuitive seer|dream reader|probability monk"
+    [quant]="data hermit|statistical phantom|arbitrage ghost"
+)
+
+PERSONALITY_PRESET="${PERSONALITY_PRESET:-default}"
+PRESET_THEMES="${PERSONALITY_PRESETS[$PERSONALITY_PRESET]:-${PERSONALITY_PRESETS[default]}}"
+
+# Split preset themes into array (pipe-delimited)
+IFS='|' read -ra PRESET_THEME_ARRAY <<< "$PRESET_THEMES"
+
+# Model assignments — one key per agent in roster order
+CLAWDIA_MODEL="${CLAWDIA_MODEL:-${CLAWDIA_MODEL:-anthropic/claude-sonnet-4-6}}"
 CLAWDIO_MODEL="${CLAWDIO_MODEL:-anthropic/claude-opus-4-6}"
 ARBITER_MODEL="${ARBITER_MODEL:-anthropic/claude-opus-4-6}"
 UTILITY_MODEL="${UTILITY_MODEL:-openai/gpt-5.4-mini}"
@@ -48,10 +77,80 @@ CLAWDIA_THINKING="${CLAWDIA_THINKING:-medium}"
 CLAWDIO_THINKING="${CLAWDIO_THINKING:-high}"
 ARBITER_THINKING="${ARBITER_THINKING:-high}"
 
-##############################################################################
-# FEATURE TOGGLES — auto-detected from env vars, overridable
-##############################################################################
+# Helper to get model for agent (checks AGENT_{name}_MODEL first, then falls back)
+get_agent_model() {
+    local name="$1"
+    local var_name="AGENT_${name^^}_MODEL"
+    local val="${!var_name:-}"
+    
+    if [[ -n "$val" ]]; then
+        echo "$val"
+    else
+        # Fall back to legacy vars for default names
+        case "$name" in
+            clawdia) echo "$CLAWDIA_MODEL" ;;
+            clawdio) echo "$CLAWDIO_MODEL" ;;
+            arbiter) echo "$ARBITER_MODEL" ;;
+            *)       echo "$UTILITY_MODEL" ;;
+        esac
+    fi
+}
 
+# Helper to get thinking level for agent
+get_agent_thinking() {
+    local name="$1"
+    local var_name="AGENT_${name^^}_THINKING"
+    local val="${!var_name:-}"
+    
+    if [[ -n "$val" ]]; then
+        echo "$val"
+    else
+        case "$name" in
+            clawdia) echo "$CLAWDIA_THINKING" ;;
+            clawdio) echo "$CLAWDIO_THINKING" ;;
+            arbiter) echo "$ARBITER_THINKING" ;;
+            *)       echo "medium" ;;
+        esac
+    fi
+}
+
+# Helper to get theme/personality for agent
+get_agent_theme() {
+    local idx="$1"
+    local name="$2"
+    local var_name="AGENT_${name^^}_THEME"
+    local val="${!var_name:-}"
+    
+    if [[ -n "$val" ]]; then
+        echo "$val"
+    elif [[ $idx -lt ${#PRESET_THEME_ARRAY[@]} ]]; then
+        echo "${PRESET_THEME_ARRAY[$idx]}"
+    else
+        echo "custom agent"
+    fi
+}
+
+# Helper to get role description
+get_agent_role() {
+    local idx="$1"
+    local name="$2"
+    local var_name="AGENT_${name^^}_ROLE"
+    local val="${!var_name:-}"
+    
+    if [[ -n "$val" ]]; then
+        echo "$val"
+    else
+        # Default roles based on preset index
+        case $idx in
+            0) echo "Opportunity Scout — finds edges, generates signals" ;;
+            1) echo "Risk Guardian — enforces limits, protects capital" ;;
+            2) echo "Arbiter — mediates disputes, makes binding rulings" ;;
+            *) echo "Autonomous Agent — contributes to triad governance" ;;
+        esac
+    fi
+}
+
+# Feature toggles — auto-detected from env vars, overridable
 USE_ELEVENLABS="${USE_ELEVENLABS:-auto}"
 USE_TELEGRAM="${USE_TELEGRAM:-auto}"
 USE_POLYMARKET="${USE_POLYMARKET:-auto}"
@@ -76,6 +175,8 @@ Options:
   --docker               Generate Dockerfile, docker-compose.yml, docker.env
   --wallet TYPE          Enable crypto treasury (btc | xmr | eth)
   --wallet-agent NAME    Which agent holds the wallet (default: clawdio)
+  --roster NAMES         Comma-separated agent names (default: clawdia,clawdio,arbiter)
+  --preset PACK          Personality pack: default|bold|conservative|mystic|quant
   --non-interactive      Never prompt (use environment only)
   --help                 Show this message
 
@@ -88,19 +189,26 @@ Optional (feature auto-enables when set):
   POLYMARKET_API_KEY     Live trading (otherwise testnet stub only)
   WALLET_PRIVATE_KEY     Crypto treasury
 
-Model overrides:
-  CLAWDIA_MODEL, CLAWDIO_MODEL, ARBITER_MODEL, UTILITY_MODEL
-  CLAWDIA_THINKING, CLAWDIO_THINKING, ARBITER_THINKING
+Agent Customization:
+  AGENT_ROSTER           "oracle,risk,arbiter" — comma-separated names
+  AGENT_{name}_THEME     Personality theme per agent
+  AGENT_{name}_ROLE      Role description per agent
+  AGENT_{name}_MODEL     Model override per agent
+  AGENT_{name}_THINKING  Thinking depth: light|medium|high
 
-Docker overrides:
-  BASE_IMAGE             Swap base image (default: python:3.11-slim)
-  CONTAINER_HOME         Container home (default: /home/openclaw)
-  CONTAINER_STATE_DIR    Container state dir (default: $CONTAINER_HOME/.openclaw)
+Personality Presets:
+  default  — Sassy oracle / Steady guardian / Wise mediator
+  bold     — Reckless visionary / Impulse trader / Momentum hunter
+  conservative — Risk sentinel / Capital warden / Loss avenger
+  mystic   — Intuitive seer / Dream reader / Probability monk
+  quant    — Data hermit / Statistical phantom / Arbitrage ghost
 
 Example:
   export NANOGPT_API_KEY="xxx"
-  export WALLET_PRIVATE_KEY="yyy" WALLET_TYPE=xmr
-  ./setup-openclaw-triad.sh --docker --wallet xmr
+  export AGENT_ROSTER="seer,sentinel,judge"
+  export AGENT_SEER_THEME="mystical raven with crystal orb"
+  export AGENT_SEER_ROLE="Probability diviner — reads market omens"
+  ./setup-openclaw-triad.sh --preset mystic
 EOF
     exit 0
 }
@@ -126,14 +234,28 @@ validate_config() {
         ok "NanoGPT key present"
     fi
 
+    # Validate agent roster
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    local agent_count=${#AGENT_NAMES[@]}
+    
+    if [[ $agent_count -lt 2 ]]; then
+        warn "Agent roster has fewer than 2 agents — minimum recommended for triad governance"
+    fi
+    
+    ok "Agent roster: ${AGENT_ROSTER} (${agent_count} agents)"
+
     if [[ "$USE_WALLET" == "true" ]]; then
         if [[ ! "$WALLET_TYPE" =~ ^(btc|xmr|eth)$ ]]; then
             warn "WALLET_TYPE '$WALLET_TYPE' invalid — falling back to btc"
             WALLET_TYPE="btc"
         fi
-        if [[ ! "$WALLET_AGENT" =~ ^(clawdia|clawdio|arbiter)$ ]]; then
-            warn "WALLET_AGENT '$WALLET_AGENT' invalid — falling back to clawdio"
-            WALLET_AGENT="clawdio"
+        # Check if wallet agent exists in roster
+        local wallet_found=false
+        for name in "${AGENT_NAMES[@]}"; do
+            [[ "$name" == "$WALLET_AGENT" ]] && wallet_found=true && break
+        done
+        if [[ "$wallet_found" != "true" ]]; then
+            warn "WALLET_AGENT '$WALLET_AGENT' not in roster — will be created anyway"
         fi
         ok "Wallet: ${WALLET_TYPE^^} held by ${WALLET_AGENT}"
     fi
@@ -150,18 +272,20 @@ create_directory_structure() {
 
     mkdir -p "${STATE_DIR}"
 
-    # Agent runtime state (sqlite transcripts live here)
-    for agent in clawdia clawdio arbiter; do
-        mkdir -p "${AGENTS_ROOT}/${agent}/agent"
-        mkdir -p "${AGENTS_ROOT}/${agent}/sessions"
+    # Agent runtime state — one per agent in roster
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    for name in "${AGENT_NAMES[@]}"; do
+        mkdir -p "${AGENTS_ROOT}/${name}/agent"
+        mkdir -p "${AGENTS_ROOT}/${name}/sessions"
     done
 
-    # Workspaces
-    mkdir -p "${WORKSPACE_ROOT}/clawdia"/{journal,analysis/setups,analysis/patterns,scratch}
-    mkdir -p "${WORKSPACE_ROOT}/clawdio"/{risk-model/historical-setups,veto-log,audits/weekly}
-    mkdir -p "${WORKSPACE_ROOT}/arbiter"/{rulings,dispute-archive,drift-watch}
+    # Workspaces — dynamic based on roster
+    for i in "${!AGENT_NAMES[@]}"; do
+        local name="${AGENT_NAMES[$i]}"
+        mkdir -p "${WORKSPACE_ROOT}/${name}"/{journal,analysis/setups,analysis/patterns,scratch}
+    done
 
-    # Wallet workspace (only when enabled)
+    # Add wallet workspace (only when enabled)
     if [[ "$USE_WALLET" == "true" ]]; then
         mkdir -p "${WORKSPACE_ROOT}/${WALLET_AGENT}/wallet"
     fi
@@ -172,7 +296,7 @@ create_directory_structure() {
     mkdir -p "${LOGS_DIR}"
     mkdir -p "${HELPERS_DIR}"
 
-    ok "Tree created under ${STATE_DIR}"
+    ok "Tree created under ${STATE_DIR} for ${#AGENT_NAMES[@]} agents"
 }
 
 ##############################################################################
@@ -180,20 +304,100 @@ create_directory_structure() {
 ##############################################################################
 
 generate_openclaw_json() {
-    step "Generating openclaw.json"
+    step "Generating openclaw.json with ${#AGENT_NAMES[@]} agents"
 
-    local tts_clawdia="" tts_clawdio="" tts_arbiter=""
-    if [[ "$USE_ELEVENLABS" == "true" ]]; then
-        tts_clawdia=$(printf ',\n        "tts": { "providers": { "elevenlabs": { "speakerVoiceId": "%s" } } }' "${ELEVENLABS_VOICE_ID:-default}")
-        tts_clawdio=$(printf ',\n        "tts": { "providers": { "elevenlabs": { "speakerVoiceId": "%s" } } }' "${ELEVENLABS_VOICE_ID_CLAWDIO:-${ELEVENLABS_VOICE_ID:-default}}")
-        tts_arbiter=$(printf ',\n        "tts": { "providers": { "elevenlabs": { "speakerVoiceId": "%s" } } }' "${ELEVENLABS_VOICE_ID_ARBITER:-${ELEVENLABS_VOICE_ID:-default}}")
-    fi
+    local entries=""
+    local bindings=""
+    local first=true
+
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    for i in "${!AGENT_NAMES[@]}"; do
+        local name="${AGENT_NAMES[$i]}"
+        local display="${name^}"  # Capitalize first letter
+        local theme
+        local role
+        local model
+        local thinking
+        
+        theme=$(get_agent_theme "$i" "$name")
+        role=$(get_agent_role "$i" "$name")
+        model=$(get_agent_model "$name")
+        thinking=$(get_agent_thinking "$name")
+
+        local tts_config=""
+        if [[ "$USE_ELEVENLABS" == "true" ]]; then
+            local voice_var="ELEVENLABS_VOICE_ID_${name^^}"
+            local voice_id="${!voice_var:-${ELEVENLABS_VOICE_ID:-default}}"
+            tts_config=$(printf ',\n        "tts": { "providers": { "elevenlabs": { "speakerVoiceId": "%s" } } }' "$voice_id")
+        fi
+
+        # Determine if this agent can have subagents (first two agents usually can)
+        local subagent_list="[]"
+        if [[ $i -eq 0 ]]; then
+            # First agent is system agent — can spawn others
+            local other_agents=""
+            for j in "${!AGENT_NAMES[@]}"; do
+                [[ $j -ne $i ]] && other_agents="${other_agents:+, }\"${AGENT_NAMES[$j]}\""
+            done
+            subagent_list="[${other_agents}]"
+        fi
+
+        # Build agent entry
+        local entry
+        entry=$(cat << EOF
+      ${name}: {
+        name: "${display}",
+        workspace: "${WORKSPACE_ROOT}/${name}",
+        agentDir: "${AGENTS_ROOT}/${name}/agent",
+        model: {
+          primary: "${model}",
+          fallbacks: ["${UTILITY_MODEL}"]
+        },
+        utilityModel: "${UTILITY_MODEL}",
+        thinkingDefault: "${thinking}",
+        reasoningDefault: "on",
+        fastModeDefault: false,
+        identity: {
+          name: "${display}",
+          theme: "${theme}"
+        },
+        tools: {
+          allow: ["read", "write", "edit", "exec", "message", "sessions_list", "sessions_history"],
+          deny: ["apply_patch", "browser", "gateway", "canvas", "nodes"]
+        },
+        subagents: { allowAgents: ${subagent_list} },
+        sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" }${tts_config}
+      }
+EOF
+)
+
+        # Build binding entry
+        local binding
+        binding="{ agentId: \"${name}\", match: { channel: \"telegram\", accountId: \"${name}\" } }"
+
+        # Append with commas
+        if [[ "$first" == "true" ]]; then
+            entries="$entry"
+            bindings="$binding"
+            first=false
+        else
+            entries="${entries},
+${entry}"
+            bindings="${bindings},
+    ${binding}"
+        fi
+    done
+
+    # Set system agent (first in roster) and heartbeat agent (second in roster)
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    local system_agent="${AGENT_NAMES[0]}"
+    local heartbeat_agent="${AGENT_NAMES[1]:-${AGENT_NAMES[0]}}"  # Fall back to first if only one
 
     cat > "${STATE_DIR}/openclaw.json" << EOF
 // ${STATE_DIR}/openclaw.json
 // Generated by setup-openclaw-triad.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 // Format: JSON5 (comments + trailing commas permitted)
-// Validate: openclaw config schema
+// Agent roster: ${AGENT_ROSTER}
 
 {
   agents: {
@@ -202,95 +406,22 @@ generate_openclaw_json() {
     defaults: {
       workspace: "${WORKSPACE_ROOT}",
       cwd: "${WORKSPACE_ROOT}",
-      systemAgent: { agentId: "clawdia" },
-      heartbeat: { agentId: "clawdio" },
-      authInheritance: { agentId: "clawdia" },
+      systemAgent: { agentId: "${system_agent}" },
+      heartbeat: { agentId: "${heartbeat_agent}" },
+      authInheritance: { agentId: "${system_agent}" },
       skills: ["market-data", "risk-limits", "trade-log", "docs-search"]
     },
 
     entries: {
-      clawdia: {
-        name: "Clawdia",
-        workspace: "${WORKSPACE_ROOT}/clawdia",
-        agentDir: "${AGENTS_ROOT}/clawdia/agent",
-        model: {
-          primary: "${CLAWDIA_MODEL}",
-          fallbacks: ["${UTILITY_MODEL}"]
-        },
-        utilityModel: "${UTILITY_MODEL}",
-        thinkingDefault: "${CLAWDIA_THINKING}",
-        reasoningDefault: "on",
-        fastModeDefault: false,
-        identity: {
-          name: "Clawdia",
-          theme: "sassy oracle — purple holographic fox, crimson claws"
-        },
-        tools: {
-          allow: ["read", "write", "edit", "exec", "message", "sessions_list", "sessions_history"],
-          deny: ["apply_patch", "browser", "gateway", "canvas", "nodes"]
-        },
-        subagents: { allowAgents: ["clawdio", "arbiter"] },
-        sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" }${tts_clawdia}
-      },
-
-      clawdio: {
-        name: "Clawdio",
-        workspace: "${WORKSPACE_ROOT}/clawdio",
-        agentDir: "${AGENTS_ROOT}/clawdio/agent",
-        model: {
-          primary: "${CLAWDIO_MODEL}",
-          fallbacks: ["${CLAWDIA_MODEL}"]
-        },
-        utilityModel: "${UTILITY_MODEL}",
-        thinkingDefault: "${CLAWDIO_THINKING}",
-        reasoningDefault: "on",
-        fastModeDefault: false,
-        identity: {
-          name: "Clawdio",
-          theme: "steady guardian — navy wolf, silver spectacles"
-        },
-        tools: {
-          allow: ["read", "write", "exec", "message", "sessions_list", "sessions_history"],
-          deny: ["apply_patch", "browser", "gateway", "canvas", "nodes"]
-        },
-        subagents: { allowAgents: [] },
-        sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" }${tts_clawdio}
-      },
-
-      arbiter: {
-        name: "The Arbiter",
-        workspace: "${WORKSPACE_ROOT}/arbiter",
-        agentDir: "${AGENTS_ROOT}/arbiter/agent",
-        model: {
-          primary: "${ARBITER_MODEL}",
-          fallbacks: ["${CLAWDIA_MODEL}"]
-        },
-        utilityModel: "${UTILITY_MODEL}",
-        thinkingDefault: "${ARBITER_THINKING}",
-        reasoningDefault: "on",
-        fastModeDefault: false,
-        identity: {
-          name: "The Arbiter",
-          theme: "wise mediator — silver owl, iridescent violet"
-        },
-        tools: {
-          allow: ["read", "message", "sessions_list", "sessions_history", "sessions_send", "session_status"],
-          deny: ["write", "edit", "apply_patch", "exec", "process", "browser", "gateway", "canvas", "nodes", "cron"]
-        },
-        subagents: { allowAgents: [] },
-        sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" }${tts_arbiter}
-      }
+${entries}
     }
   },
 
   bindings: [
-    { agentId: "clawdia", match: { channel: "telegram", accountId: "default" } },
-    { agentId: "clawdio", match: { channel: "telegram", accountId: "risk" } },
-    { agentId: "arbiter", match: { channel: "telegram", accountId: "arbiter" } },
-    { agentId: "clawdia", match: { channel: "telegram", accountId: "" } }
+    ${bindings}
   ],
 
-  talk: { agentId: "clawdia" },
+  talk: { agentId: "${system_agent}" },
 
   channels: {
     telegram: {
@@ -361,7 +492,7 @@ EOF
 }
 
 generate_env_template() {
-    step "Generating .env template"
+    step "Generating .env template with agent customization section"
 
     cat > "${STATE_DIR}/.env.example" << 'EOF'
 # =============================================================================
@@ -370,14 +501,33 @@ generate_env_template() {
 NANOGPT_API_KEY=
 
 # =============================================================================
+# AGENT CUSTOMIZATION — redefine your triad
+# =============================================================================
+# AGENT_ROSTER=oracle,risk,arbiter           # Comma-separated agent names
+# AGENT_ORACLE_THEME=mystical seer with crystal ball
+# AGENT_ORACLE_ROLE=Probability diviner — reads market omens
+# AGENT_ORACLE_MODEL=anthropic/claude-sonnet-4-6
+# AGENT_ORACLE_THINKING=medium
+#
+# AGENT_RISK_THEME=navy guardian wolf
+# AGENT_RISK_ROLE=Capital warden — enforces loss limits
+# AGENT_RISK_MODEL=anthropic/claude-opus-4-6
+# AGENT_RISK_THINKING=high
+#
+# AGENT_ARBITER_THEME=silver owl mediator
+# AGENT_ARBITER_ROLE=Final authority — resolves conflicts
+# AGENT_ARBITER_MODEL=anthropic/claude-opus-4-6
+# AGENT_ARBITER_THINKING=high
+
+# =============================================================================
 # OPTIONAL — uncomment and fill to enable the feature
 # =============================================================================
 
 # ElevenLabs TTS (per-agent voice overrides supported)
 # ELEVENLABS_API_KEY=
-# ELEVENLABS_VOICE_ID=
-# ELEVENLABS_VOICE_ID_CLAWDIO=
-# ELEVENLABS_VOICE_ID_ARBITER=
+# ELEVENLABS_VOICE_ID=default
+# ELEVENLABS_VOICE_ID_ORACLE=voice_id_1
+# ELEVENLABS_VOICE_ID_RISK=voice_id_2
 
 # Telegram chat interface
 # TELEGRAM_BOT_TOKEN=
@@ -404,28 +554,34 @@ EOF
 }
 
 ##############################################################################
-# AGENT WORKSPACE FILES
+# AGENT WORKSPACE FILES — FULLY DYNAMIC
 ##############################################################################
 
 generate_agent_files() {
-    step "Generating agent workspace files"
+    step "Generating agent workspace files for ${#AGENT_NAMES[@]} agents"
 
-    for agent in clawdia clawdio arbiter; do
-        local display model thinking
-        case "$agent" in
-            clawdia) display="Clawdia";      model="$CLAWDIA_MODEL"; thinking="$CLAWDIA_THINKING" ;;
-            clawdio) display="Clawdio";      model="$CLAWDIO_MODEL"; thinking="$CLAWDIO_THINKING" ;;
-            arbiter) display="The Arbiter";  model="$ARBITER_MODEL"; thinking="$ARBITER_THINKING" ;;
-        esac
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    for i in "${!AGENT_NAMES[@]}"; do
+        local name="${AGENT_NAMES[$i]}"
+        local display="${name^}"  # Capitalize first letter
+        local theme
+        local role
+        local model
+        local thinking
+        
+        theme=$(get_agent_theme "$i" "$name")
+        role=$(get_agent_role "$i" "$name")
+        model=$(get_agent_model "$name")
+        thinking=$(get_agent_thinking "$name")
 
-        cat > "${WORKSPACE_ROOT}/${agent}/IDENTITY.md" << EOF
+        cat > "${WORKSPACE_ROOT}/${name}/IDENTITY.md" << EOF
 # IDENTITY.md — ${display}
 
 **Runtime:** OpenClaw Triad
 **Provider:** NanoGPT (\`https://nano-gpt.com/api/v1\`)
 **Model:** \`${model}\`
 **Thinking:** \`${thinking}\`
-**Workspace:** \`${WORKSPACE_ROOT}/${agent}\`
+**Workspace:** \`${WORKSPACE_ROOT}/${name}\`
 **Generated:** $(date -u +"%Y-%m-%d")
 
 ---
@@ -433,44 +589,111 @@ generate_agent_files() {
 See \`SOUL.md\` for temperament and \`AGENTS.md\` for role and protocol.
 EOF
 
-        cat > "${WORKSPACE_ROOT}/${agent}/AGENTS.md" << EOF
+        cat > "${WORKSPACE_ROOT}/${name}/AGENTS.md" << EOF
 # AGENTS.md — ${display}'s Role
 
 | Field | Value |
 |---|---|
-| Agent id | \`${agent}\` |
+| Agent id | \`${name}\` |
 | Model | \`${model}\` |
 | Thinking | \`${thinking}\` |
-| Workspace | \`${WORKSPACE_ROOT}/${agent}\` |
-| State dir | \`${AGENTS_ROOT}/${agent}/agent\` |
+| Workspace | \`${WORKSPACE_ROOT}/${name}\` |
+| State dir | \`${AGENTS_ROOT}/${name}/agent\` |
+| Theme | ${theme} |
 
 ---
 
-Governance: no single agent executes alone. Alignment between Clawdia and
-Clawdio authorises execution; disagreement escalates to the Arbiter, whose
-ruling is binding.
+**Role:** ${role}
+
+---
+
+Governance: no single agent executes alone. Alignment between at least two
+agents authorizes execution; disagreement escalates to the highest-indexed
+agent in the roster, whose ruling is binding.
 EOF
 
-        cat > "${WORKSPACE_ROOT}/${agent}/SOUL.md" << EOF
+        cat > "${WORKSPACE_ROOT}/${name}/SOUL.md" << EOF
 # SOUL.md — ${display}
 
-Placeholder. Replace with the full archetype definition.
+**Theme:** ${theme}
 
-- **Clawdia** — The Sassy Oracle: intuitive, impulsive, high conviction
-- **Clawdio** — The Steady Guardian: prudent, analytical, capital-first
-- **The Arbiter** — The Wise Mediator: neutral, synthesising, final authority
+## Temperament Profile
+
+Generated from personality preset: \`${PERSONALITY_PRESET}\`
+
+### Core Traits
+- **Primary function:** ${role}
+- **Decision style:** Derived from \`${thinking}\` thinking depth
+- **Bias profile:** Adjust via AGENT_${name^^}_BIAS env var
+
+### Behavioral Guidelines
+
+Replace this section with your custom archetype definition. Examples:
+
+---
+**For a mystical archetype:**
+- Trusts pattern recognition over explicit calculation
+- Seeks coherence across seemingly unrelated signals
+- Operates with higher uncertainty tolerance
+
+**For a conservative archetype:**
+- Requires 95%+ confidence before any action
+- Prefers small, repeated wins over large bets
+- Automatically rejects trades with asymmetric downside
+
+**For a bold archetype:**
+- Acts on 60%+ conviction thresholds
+- Embraces concentration during clear edges
+- Accepts drawdowns as learning investment
+---
+
+### Calibration Targets
+
+Track accuracy and alignment here:
+- Signal hit rate: TBD
+- False positive rate: TBD
+- Alignment with consensus: TBD
+
+Current phase: testnet
 EOF
 
-        cat > "${WORKSPACE_ROOT}/${agent}/DREAMS.md" << EOF
+        cat > "${WORKSPACE_ROOT}/${name}/DREAMS.md" << EOF
 # DREAMS.md — ${display}
 
-Placeholder. Track milestones and calibration targets here.
+**Goal:** Evolve ${theme} into a calibrated trading entity
 
-**Current phase:** testnet
+## Milestones
+
+### Phase 1: Testnet Validation
+- [ ] Run 30 consecutive days without manual intervention
+- [ ] Achieve >55% signal accuracy on Polymarket
+- [ ] Zero policy violations or risk breaches
+
+### Phase 2: Paper Trading
+- [ ] Match or exceed benchmark P&L for 90 days
+- [ ] Demonstrate consistent risk-adjusted returns
+- [ ] Survive 3+ market regime changes
+
+### Phase 3: Live Capital
+- [ ] Start with $100 allocation
+- [ ] Scale 2x monthly while maintaining Sharpe >1.5
+- [ ] Reach $10k without drawdown >20%
+
+## Reflection Prompts
+
+Answer these weekly:
+1. What trades did I veto that later proved correct?
+2. What signals did I miss that were obvious in hindsight?
+3. How has my ${theme} archetype evolved this week?
+
+---
+
+Generated: $(date -u +"%Y-%m-%d")
 EOF
 
-        touch "${WORKSPACE_ROOT}/${agent}/journal/$(date +%Y-%m-%d).md"
-        ok "${display} (${model})"
+        # Create journal file
+        touch "${WORKSPACE_ROOT}/${name}/journal/$(date +%Y-%m-%d).md"
+        ok "${display} (${model}, thinking: ${thinking})"
     done
 }
 
@@ -624,13 +847,23 @@ generate_telegram_bot() {
         return
     fi
 
-    step "Generating Telegram bot"
+    step "Generating Telegram bot with dynamic agent routing"
 
     mkdir -p "${PLUGINS_DIR}/telegram-bot"
 
-    cat > "${PLUGINS_DIR}/telegram-bot/bot.py" << 'PYEOF'
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    local agent_commands=""
+    for name in "${AGENT_NAMES[@]}"; do
+        local display="${name^}"
+        agent_commands="${agent_commands}/${name} — ${display}\n"
+    done
+
+    cat > "${PLUGINS_DIR}/telegram-bot/bot.py" << EOF
 #!/usr/bin/env python3
-"""Telegram front-end for the OpenClaw triad."""
+"""Telegram front-end for the OpenClaw triad.
+
+Agent roster: ${AGENT_ROSTER}
+"""
 
 import logging
 import os
@@ -653,6 +886,9 @@ log = logging.getLogger("openclaw.telegram")
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED = {u.strip() for u in os.environ.get("TELEGRAM_USER_ID", "").split(",") if u.strip()}
 
+# Dynamic agent list from roster
+AVAILABLE_AGENTS = [a.strip() for a in "${AGENT_ROSTER}".split(",")]
+
 
 def authorised(update: Update) -> bool:
     return str(update.effective_user.id) in ALLOWED
@@ -661,22 +897,54 @@ def authorised(update: Update) -> bool:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
+    
+    agent_help = "\n".join([f"/{a} — ${{a.capitalize()}}" for a in AVAILABLE_AGENTS])
+    
     await update.message.reply_text(
-        "OpenClaw triad online.\n"
-        "/clawdia — opportunity scout\n"
-        "/clawdio — risk guardian\n"
-        "/arbiter — mediator"
+        f"OpenClaw triad online.\\nAgents: \\${', '.join(AVAILABLE_AGENTS)}\\n\\n"
+        f"{agent_help}\\n"
+        "/list — List all agents and their roles"
     )
 
 
+async def list_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all agents with their roles."""
+    if not authorised(update):
+        return
+    
+    roles = {
+        "clawdia": "Opportunity Scout",
+        "clawdio": "Risk Guardian", 
+        "arbiter": "Mediator",
+    }
+    
+    # Try to fetch from config if available
+    role_str = ""
+    for name in AVAILABLE_AGENTS:
+        role = roles.get(name, "Autonomous Agent")
+        role_str += f"• {{name}} ({role})\\n"
+    
+    await update.message.reply_text(f"Active Agents:\\n{{role_str}}")
+
+
 async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward an authorised message to the OpenClaw gateway."""
+    """Forward an authorised message to the appropriate agent."""
     if not authorised(update):
         log.warning("Rejected message from %s", update.effective_user.id)
         return
-
-    # TODO: route to the gateway (HTTP or socket) and stream the reply back.
-    await update.message.reply_text("Received. Routing to the triad…")
+    
+    # Route based on command prefix: /clawdia, /clawdio, etc.
+    msg_text = update.message.text
+    if msg_text.startswith("/"):
+        command = msg_text.split()[0][1:]  # Strip slash
+        if command in AVAILABLE_AGENTS:
+            await update.message.reply_text(f"Routing to {{command.capitalize()}}…")
+            # TODO: route to the gateway (HTTP or socket) and stream the reply back.
+        else:
+            await update.message.reply_text(f"Unknown agent. Available: {{', '.join(AVAILABLE_AGENTS)}}")
+    else:
+        # Broadcast to all agents
+        await update.message.reply_text("Received. Broadcasting to all agents…")
 
 
 def main() -> None:
@@ -687,15 +955,16 @@ def main() -> None:
 
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("list", list_agents))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay))
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-PYEOF
+EOF
 
-    ok "telegram bot scaffold"
+    ok "telegram bot scaffold for ${#AGENT_NAMES[@]} agents"
 }
 
 ##############################################################################
@@ -761,7 +1030,7 @@ EOF
 # Generated by setup-openclaw-triad.sh
 #
 # Every path is a variable, defaulting to whatever the setup script resolved.
-# Change docker.env to relocate the stack without regenerating anything.
+# Change docker.env to relocate the stack without rebuilding anything.
 #
 #   docker compose --env-file docker.env up -d
 #
@@ -975,19 +1244,47 @@ EOF
 
     echo '{}' > "${SHARED_DIR}/state/daily-counters.json"
 
-    cat > "${SHARED_DIR}/calibration/README.md" << 'EOF'
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+    local calibration_entries=""
+    for i in "${!AGENT_NAMES[@]}"; do
+        local name="${AGENT_NAMES[$i]}"
+        local trait=""
+        case $i in
+            0) trait="hunches" ;;
+            1) trait="vetoes" ;;
+            2) trait="rulings" ;;
+            *) trait="signals" ;;
+        esac
+        
+        calibration_entries="${calibration_entries}
+| \`${name}-${trait}.csv\` | Measure specific to ${name} |"
+    done
+
+    cat > "${SHARED_DIR}/calibration/README.md" << EOF
 # Calibration Archive
 
 Tracks each agent's accuracy over time.
 
-| File | Measures |
-|---|---|
-| `clawdia-hunches.csv` | Intuition hit rate by setup category |
-| `clawdio-vetoes.csv` | Whether denied trades would have failed |
-| `arbiter-rulings.csv` | Whether synthesised rulings were vindicated |
+**Agent Roster:** ${AGENT_ROSTER}
+
+## Metrics${calibration_entries}
 
 Reviewed weekly.
+
+## Agent-Specific Targets
+
 EOF
+
+    for name in "${AGENT_NAMES[@]}"; do
+        cat >> "${SHARED_DIR}/calibration/README.md" << EOF
+
+### ${name^}
+- **Signal accuracy:** Target >55%
+- **False positive rate:** Target <10%
+- **Drawdown tolerance:** Per role definition
+
+EOF
+    done
 
     ok "ledger, counters, calibration"
 }
@@ -1005,29 +1302,50 @@ print_summary() {
     [[ "$USE_WALLET"     == "true" ]] && f_wal="$tick" || f_wal="$cross"
     [[ "$DOCKER_ENABLE"  == "true" ]] && f_doc="$tick" || f_doc="$cross"
 
+    IFS=',' read -ra AGENT_NAMES <<< "$AGENT_ROSTER"
+
     cat << EOF
 
-════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════
   SETUP COMPLETE
-════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════
 
-  State directory   ${STATE_DIR}
-  Workspaces        ${WORKSPACE_ROOT}
-  Agent state       ${AGENTS_ROOT}
+  State directory    ${STATE_DIR}
+  Workspaces         ${WORKSPACE_ROOT}
+  Agent count        ${#AGENT_NAMES[@]}
+  Personality preset ${PERSONALITY_PRESET}
+
+  Agents
+EOF
+
+    for i in "${!AGENT_NAMES[@]}"; do
+        local name="${AGENT_NAMES[$i]}"
+        local display="${name^}"
+        local theme
+        local model
+        local thinking
+        
+        theme=$(get_agent_theme "$i" "$name")
+        model=$(get_agent_model "$name")
+        thinking=$(get_agent_thinking "$name")
+        
+        echo "    $(printf '%2d' $((i+1))). ${display}" >> /dev/null
+        cat << EOF
+    • ${display} — ${theme}
+      Model: ${model}
+      Thinking: ${thinking}
+EOF
+    done
+
+    cat << EOF
 
   Features
-    NanoGPT API        ✓  (required)
+    NanoGPT API        ${tick}  (required)
     ElevenLabs TTS     ${f_tts}
     Telegram bot       ${f_tg}
     Polymarket CLOB    ${f_pm}
     Crypto treasury    ${f_wal}$( [[ "$USE_WALLET" == "true" ]] && echo "  (${WALLET_TYPE^^} · ${WALLET_AGENT})" )
     Docker             ${f_doc}
-
-  Models
-    Clawdia            ${CLAWDIA_MODEL}
-    Clawdio            ${CLAWDIO_MODEL}
-    Arbiter            ${ARBITER_MODEL}
-    Utility            ${UTILITY_MODEL}
 
 EOF
 
@@ -1047,10 +1365,11 @@ EOF
     cat << EOF
   Next
     1. Fill in ${STATE_DIR}/.env
-    2. openclaw config schema
-    3. openclaw start
+    2. Customize agent SOUL.md files for your personas
+    3. openclaw config schema
+    4. openclaw start
 
-════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════
 EOF
 }
 
@@ -1080,6 +1399,14 @@ main() {
             --wallet-agent)
                 [[ -n "${2:-}" ]] || { echo "--wallet-agent needs a name"; exit 1; }
                 WALLET_AGENT="$2"; shift 2
+                ;;
+            --roster)
+                [[ -n "${2:-}" ]] || { echo "--roster needs comma-separated names"; exit 1; }
+                AGENT_ROSTER="$2"; shift 2
+                ;;
+            --preset)
+                [[ -n "${2:-}" ]] || { echo "--preset needs a pack name"; exit 1; }
+                PERSONALITY_PRESET="$2"; shift 2
                 ;;
             --non-interactive) shift ;;
             --help|-h)      usage ;;
