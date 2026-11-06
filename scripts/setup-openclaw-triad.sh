@@ -1,39 +1,26 @@
 #!/usr/bin/env bash
 #
-# setup-openclaw-triad.sh  (v2.4 — roster-driven, Bash 3.2 SAFE, compose-compatible)
+# setup-openclaw-triad.sh  (v2.5 — roster-driven, Bash 3.2 SAFE, OpenClaw-native)
 # Portable, parameterized OpenClaw triad workspace builder
 #
-# v2.4 CHANGELOG (vs v2.3):
-#   - Dockerfile group creation is now idempotent: getent-guarded groupadd
-#     reuses an existing GID (macOS host GID 20 = staff collides with the
-#     Debian base image's GID 20 = dialout) instead of failing the build.
+# v2.5 CHANGELOG (vs v2.4) — every runtime fix from live deployment baked in:
+#   - Base image switched to node:24-slim (OpenClaw requires Node 24+);
+#     python3 installed via apt for plugin deps.
+#   - OpenClaw runtime installed in-image: npm install -g openclaw --allow-scripts=openclaw
+#   - CMD corrected to `openclaw gateway` (there is no `openclaw start`).
+#   - openclaw.json: added required `gateway: { mode: "local" }`; removed the
+#     rejected `memory.enabled` and root-level `web` keys.
+#   - Dockerfile: group creation idempotent via getent (macOS GID 20 collision).
+#   - docker-compose: whole state dir mounted (runtime needs tmp/, sqlite state,
+#     lock files) with config kept read-only on top; .cache tmpfs given explicit
+#     uid/gid (root-owned 0700 tmpfs breaks the runtime's secure-temp check);
+#     no top-level `name:` key (older compose schemas reject it).
+#   - State dir now includes tmp/ subdirectory.
+#   - .env.example includes OPENCLAW_GATEWAY_TOKEN (gateway refuses unauthenticated
+#     non-loopback bind).
 #
-# v2.3 CHANGELOG (vs v2.2):
-#   - docker.env now defines BASE_IMAGE explicitly (silences compose warning,
-#     guarantees the intended default image everywhere).
-#   - docker-compose.yml no longer uses the top-level `name:` key (unsupported
-#     by older Docker Compose schemas). Project name comes solely from
-#     COMPOSE_PROJECT_NAME in docker.env, which works on all versions.
-#
-# v2.2 CHANGELOG (vs v2.1):
-#   - Removed all nested $(...)/[[...]] constructs from INSIDE heredocs
-#     (Bash 3.2 misparses these; caused phantom parse errors downstream).
-#
-# COMPATIBILITY: macOS stock Bash 3.2; Docker Compose v1.29+ and v2.x.
-#
-# USAGE:
-#   ./setup-openclaw-triad.sh                        # Auto-detect features from env
-#   ./setup-openclaw-triad.sh --docker               # Also generate Docker config
-#   ./setup-openclaw-triad.sh --docker --wallet xmr  # Docker + treasury
-#   ./setup-openclaw-triad.sh --state-dir /srv/openclaw
-#   ./setup-openclaw-triad.sh --preset mystic        # Quick personality pack
-#
-# ROSTER MODEL:
-#   AGENT_ROSTER="seer,guardian,sage" drives everything.
-#   Position semantics are FIXED regardless of names:
-#     position 1 = scout   (proposes trades, may write/exec)
-#     position 2 = risk    (validates/vetoes, may write/exec)
-#     position 3 = arbiter (rules on disputes, READ-ONLY)
+# v2.4: idempotent user setup; v2.3: BASE_IMAGE in docker.env, no `name:` key;
+# v2.2: no nested $( ) inside heredocs (Bash 3.2 parser safety).
 #
 set -euo pipefail
 
@@ -51,6 +38,9 @@ HELPERS_DIR="${STATE_DIR}/helpers"
 
 CONTAINER_HOME="${CONTAINER_HOME:-/home/openclaw}"
 CONTAINER_STATE_DIR="${CONTAINER_STATE_DIR:-${CONTAINER_HOME}/.openclaw}"
+
+OPENCLAW_VERSION="${OPENCLAW_VERSION:-latest}"
+BASE_IMAGE="${BASE_IMAGE:-node:24-slim}"
 
 ###############################################################################
 # ROSTER + PERSONALITY DEFAULTS
@@ -170,7 +160,6 @@ WALLET_TYPE="${WALLET_TYPE:-btc}"
 WALLET_AGENT="${WALLET_AGENT:-$RISK}"   # risk-position agent custodies by default
 
 DOCKER_ENABLE="${DOCKER_ENABLE:-false}"
-BASE_IMAGE="${BASE_IMAGE:-python:3.11-slim}"
 
 ###############################################################################
 # HELPERS
@@ -196,9 +185,11 @@ Environment:
   AGENT_{NAME}_ROLE      per-agent role description
   AGENT_{NAME}_MODEL     per-agent model override
   AGENT_{NAME}_THINKING  per-agent reasoning depth (low|medium|high)
+  OPENCLAW_VERSION       npm version spec for the runtime (default: latest)
 
 Required:
   NANOGPT_API_KEY        Single key for all models
+  OPENCLAW_GATEWAY_TOKEN Gateway auth token (openssl rand -hex 32)
 
 Optional (auto-enable when set):
   ELEVENLABS_API_KEY, TELEGRAM_BOT_TOKEN,
@@ -237,6 +228,12 @@ validate_config() {
     else
         ok "NanoGPT key present"
     fi
+    if [[ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]]; then
+        warn "OPENCLAW_GATEWAY_TOKEN not set — gateway will refuse non-loopback bind"
+        warn "Generate one with: openssl rand -hex 32"
+    else
+        ok "Gateway token present"
+    fi
 
     ok "Roster: ${SCOUT} (scout) / ${RISK} (risk) / ${JUDGE} (arbiter)"
     ok "Preset: ${PERSONALITY_PRESET}"
@@ -265,8 +262,8 @@ create_directory_structure() {
     step "Creating directory structure"
 
     mkdir -p "${STATE_DIR}"
-    mkdir -p "${STATE_DIR}/tmp"
-    
+    mkdir -p "${STATE_DIR}/tmp"     # runtime lock/lease files (tmp/openclaw-<uid>)
+
     for agent in "${ROSTER[@]}"; do
         mkdir -p "${AGENTS_ROOT}/${agent}/agent"
         mkdir -p "${AGENTS_ROOT}/${agent}/sessions"
@@ -299,7 +296,7 @@ create_directory_structure() {
 }
 
 ###############################################################################
-# OPENCLAW.JSON — all values precomputed; heredocs reference plain vars only
+# OPENCLAW.JSON — gateway.mode required; memory/web keys not in schema
 ###############################################################################
 
 generate_openclaw_json() {
@@ -326,14 +323,12 @@ generate_openclaw_json() {
             tools_deny='["write", "edit", "apply_patch", "exec", "process", "browser", "gateway", "canvas", "nodes", "cron"]'
         fi
 
-        # Sub-agents: only the scout may delegate. Precomputed as plain string.
         if [[ $i -eq 1 ]]; then
             subagents_str="\"${RISK}\", \"${JUDGE}\""
         else
             subagents_str=""
         fi
 
-        # TTS block (precomputed)
         tts_block=""
         if [[ "$USE_ELEVENLABS" == "true" ]]; then
             voice_var="ELEVENLABS_VOICE_ID_$(upper "$agent")"
@@ -375,7 +370,7 @@ ENTRYEOF
 
     cat > "${STATE_DIR}/openclaw.json" << JSONEOF
 // ${STATE_DIR}/openclaw.json
-// Generated by setup-openclaw-triad.sh (v2.4) on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+// Generated by setup-openclaw-triad.sh (v2.5) on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 // Format: JSON5 (comments + trailing commas permitted)
 
 {
@@ -407,13 +402,12 @@ ${json_agents}
     telegram: { allowFrom: ["${TELEGRAM_USER_ID:-}"] }
   },
 
-  tools: { swarm: false },
-  memory: { enabled: true },
-  web: { enabled: true }
+  gateway: { mode: "local" },
+  tools: { swarm: false }
 }
 JSONEOF
 
-    ok "openclaw.json (paths resolved to ${STATE_DIR})"
+    ok "openclaw.json (gateway.mode=local, paths resolved to ${STATE_DIR})"
 }
 
 ###############################################################################
@@ -473,7 +467,7 @@ TRADEEOF
 }
 
 ###############################################################################
-# ENV TEMPLATE — uppercase IDs precomputed (SCOUT_U/RISK_U/JUDGE_U)
+# ENV TEMPLATE
 ###############################################################################
 
 generate_env_template() {
@@ -484,6 +478,10 @@ generate_env_template() {
 # REQUIRED
 # =============================================================================
 NANOGPT_API_KEY=
+
+# Gateway auth token (gateway refuses non-loopback bind without it)
+# Generate with: openssl rand -hex 32
+OPENCLAW_GATEWAY_TOKEN=
 
 # =============================================================================
 # ROSTER + PERSONALITY (pre-generation)
@@ -531,7 +529,7 @@ ENVEOF
 }
 
 ###############################################################################
-# AGENT WORKSPACE FILES — all substitutions precomputed before heredocs
+# AGENT WORKSPACE FILES
 ###############################################################################
 
 temperament_note() {
@@ -577,7 +575,6 @@ generate_agent_files() {
         theme="$(get_theme "$agent" "$i")"
         role="$(get_role "$agent" "$i")"
 
-        # Position label — precomputed (no nested $([[ ]]) inside heredocs)
         case $i in
             1) position_label="1 of 3 — scout" ;;
             2) position_label="2 of 3 — risk" ;;
@@ -732,7 +729,7 @@ WALLEOF
 }
 
 ###############################################################################
-# CONDITIONAL: TELEGRAM (commands derive from roster)
+# CONDITIONAL: TELEGRAM
 ###############################################################################
 
 generate_telegram_bot() {
@@ -810,7 +807,7 @@ BOTPYEOF
 }
 
 ###############################################################################
-# CONDITIONAL: DOCKER (v2.4: idempotent group creation — macOS GID 20 safe)
+# CONDITIONAL: DOCKER — OpenClaw-native image, all live-deployment fixes baked in
 ###############################################################################
 
 generate_docker_config() {
@@ -840,7 +837,6 @@ generate_docker_config() {
 
 COMPOSE_PROJECT_NAME=openclaw-triad
 
-# Base image for the build — defined here so every compose version sees it.
 BASE_IMAGE=${BASE_IMAGE}
 
 # ---- Host paths (derived from OPENCLAW_STATE_DIR) ----
@@ -859,8 +855,7 @@ CONTAINER_STATE_DIR=${CONTAINER_STATE_DIR}
 
 # ---- Ownership (matches host user so bind mounts stay writable) ----
 # NOTE: on macOS the primary GID is 20 (staff), which already exists inside
-# Debian base images (dialout). The Dockerfile reuses an existing GID via
-# getent instead of failing on groupadd.
+# Debian base images. The Dockerfile reuses an existing GID via getent.
 APP_UID=${app_uid}
 APP_GID=${app_gid}
 
@@ -869,8 +864,9 @@ CONTAINER_MEM_LIMIT=1g
 CONTAINER_CPUS=1.0
 DOCKENVEOF
 
-    # NOTE: no top-level `name:` key — older Docker Compose schemas reject it.
-    # The project name comes from COMPOSE_PROJECT_NAME in docker.env instead.
+    # No top-level `name:` key — COMPOSE_PROJECT_NAME handles naming on all
+    # compose versions. Whole state dir is mounted (the runtime needs tmp/,
+    # sqlite state, lease locks); config stays read-only on top of it.
     cat > "${STATE_DIR}/docker-compose.yml" << 'COMPOSEEOF'
 services:
   openclaw-triad:
@@ -878,11 +874,12 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        BASE_IMAGE: ${BASE_IMAGE:-python:3.11-slim}
+        BASE_IMAGE: ${BASE_IMAGE:-node:24-slim}
         CONTAINER_HOME: ${CONTAINER_HOME:-/home/openclaw}
         CONTAINER_STATE_DIR: ${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}
         APP_UID: ${APP_UID:-1000}
         APP_GID: ${APP_GID:-1000}
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-latest}
 
     image: ${COMPOSE_PROJECT_NAME:-openclaw-triad}:local
     container_name: ${COMPOSE_PROJECT_NAME:-openclaw-triad}
@@ -900,12 +897,10 @@ services:
       PYTHONPYCACHEPREFIX: /tmp/pycache
 
     volumes:
+      # Whole state dir: runtime needs tmp/, sqlite state, lease files
+      - ${OPENCLAW_HOST_STATE_DIR}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}
+      # Config stays read-only on top of the writable parent
       - ${OPENCLAW_CONFIG_FILE}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}/openclaw.json:ro
-      - ${OPENCLAW_WORKSPACE_DIR}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}/workspace-triad
-      - ${OPENCLAW_AGENTS_DIR}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}/agents
-      - ${OPENCLAW_SHARED_DIR}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}/shared
-      - ${OPENCLAW_LOGS_DIR}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}/logs
-      - ${OPENCLAW_PLUGINS_DIR}:${CONTAINER_STATE_DIR:-/home/openclaw/.openclaw}/plugins
 
     networks:
       - openclaw-net
@@ -918,7 +913,9 @@ services:
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /var/tmp:size=16m,mode=1777
-      - ${CONTAINER_HOME:-/home/openclaw}/.cache:size=64m,mode=0700
+      # uid/gid required: root-owned 0700 tmpfs breaks the runtime's
+      # secure-temp-directory ownership check
+      - ${CONTAINER_HOME:-/home/openclaw}/.cache:size=64m,mode=0700,uid=${APP_UID:-1000},gid=${APP_GID:-1000}
 
     mem_limit: ${CONTAINER_MEM_LIMIT:-1g}
     cpus: ${CONTAINER_CPUS:-1.0}
@@ -941,33 +938,36 @@ networks:
     driver: bridge
 COMPOSEEOF
 
-    # v2.4: group creation is getent-guarded. If the host-matched GID already
-    # exists in the base image (macOS GID 20 -> Debian dialout), the existing
-    # group is reused instead of failing the build with exit code 4.
+    # Node 24 base (OpenClaw requires Node 24.16+/26+). Idempotent group
+    # creation via getent (macOS GID 20 collision). Runtime installed in-image.
     cat > "${STATE_DIR}/Dockerfile" << 'DOCKERFILEEOF'
 # syntax=docker/dockerfile:1
-# Generated by setup-openclaw-triad.sh (v2.4)
+# Generated by setup-openclaw-triad.sh (v2.5)
 
-ARG BASE_IMAGE=python:3.11-slim
+ARG BASE_IMAGE=node:24-slim
+
+FROM ${BASE_IMAGE}
+
 ARG CONTAINER_HOME=/home/openclaw
 ARG CONTAINER_STATE_DIR=/home/openclaw/.openclaw
 ARG APP_UID=1000
 ARG APP_GID=1000
-
-FROM ${BASE_IMAGE}
-
-ARG CONTAINER_HOME
-ARG CONTAINER_STATE_DIR
-ARG APP_UID
-ARG APP_GID
+ARG OPENCLAW_VERSION=latest
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     HOME=${CONTAINER_HOME} \
     OPENCLAW_STATE_DIR=${CONTAINER_STATE_DIR} \
-    OPENCLAW_CONFIG_PATH=${CONTAINER_STATE_DIR}/openclaw.json \
-    PATH=${CONTAINER_HOME}/.local/bin:${PATH}
+    OPENCLAW_CONFIG_PATH=${CONTAINER_STATE_DIR}/openclaw.json
+
+# python3 for the plugin tooling (Telegram bot, polymarket plugin)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# OpenClaw runtime — official install per docs.openclaw.ai/install
+RUN npm install -g "openclaw@${OPENCLAW_VERSION}" --allow-scripts=openclaw
 
 # Idempotent group creation: reuse an existing GID rather than failing.
 # (macOS hosts pass GID 20; Debian images already have a group there.)
@@ -982,15 +982,13 @@ RUN getent group "${APP_GID}" >/dev/null 2>&1 \
 WORKDIR ${CONTAINER_HOME}
 
 COPY --chown=${APP_UID}:${APP_GID} requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --requirement /tmp/requirements.txt \
+RUN pip3 install --no-cache-dir --break-system-packages \
+    --requirement /tmp/requirements.txt \
  && rm -f /tmp/requirements.txt
 
 USER openclaw
 
-# TODO: install the OpenClaw runtime itself. Verify the official install
-# method at https://docs.openclaw.ai before relying on this.
-
-CMD ["openclaw", "start"]
+CMD ["openclaw", "gateway"]
 DOCKERFILEEOF
 
     cat > "${STATE_DIR}/requirements.txt" << 'REQEOF'
@@ -1008,6 +1006,8 @@ agents/
 shared/
 logs/
 workspace-triad/
+tmp/
+state/
 .git
 .gitignore
 *.pyc
@@ -1016,11 +1016,11 @@ tests/
 fixtures/
 DIEOF
 
-    ok "docker-compose.yml, docker.env, Dockerfile (idempotent user setup)"
+    ok "docker-compose.yml, docker.env, Dockerfile (node base + openclaw runtime)"
 }
 
 ###############################################################################
-# SUMMARY — all conditionals precomputed, no $( ) inside heredocs
+# SUMMARY
 ###############################################################################
 
 print_summary() {
@@ -1070,19 +1070,19 @@ print_summary() {
 
   Features
     NanoGPT API        [ok] (required)
+    Gateway token      [ok] (required)
     ElevenLabs TTS     ${f_tts}
     Telegram bot       ${f_tg}
     Polymarket CLOB    ${f_pm}
     Crypto treasury    ${f_wal}${wallet_extra}
     Docker             ${f_doc}
 
-  Models:${model_lines}
-${docker_block}
+  Models:${model_lines}${docker_block}
 
   Next
-    1. Fill in ${STATE_DIR}/.env
-    2. openclaw config schema
-    3. openclaw start
+    1. Fill in ${STATE_DIR}/.env (NANOGPT_API_KEY, OPENCLAW_GATEWAY_TOKEN)
+    2. make setup (again, to regenerate with your values)
+    3. make docker-build && make docker-up
 
 ======================================================
 SUMEOF
