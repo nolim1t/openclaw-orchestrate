@@ -265,7 +265,8 @@ create_directory_structure() {
     step "Creating directory structure"
 
     mkdir -p "${STATE_DIR}"
-
+    mkdir -p "${STATE_DIR}/tmp"
+    
     for agent in "${ROSTER[@]}"; do
         mkdir -p "${AGENTS_ROOT}/${agent}/agent"
         mkdir -p "${AGENTS_ROOT}/${agent}/sessions"
