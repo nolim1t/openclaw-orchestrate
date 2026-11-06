@@ -392,7 +392,7 @@ ${json_agents}
   bindings: [
     { agentId: "${SCOUT}", match: { channel: "telegram", accountId: "default" } },
     { agentId: "${RISK}",  match: { channel: "telegram", accountId: "risk" } },
-    { agentId: "${JUDGE}", match: { channel: "telegram", accountId: "arbiter" } },
+    { agentId: "${JUDGE}", match: { channel: "telegram", accountId: "${JUDGE}" } },
     { agentId: "${SCOUT}", match: { channel: "telegram", accountId: "" } }
   ],
 
