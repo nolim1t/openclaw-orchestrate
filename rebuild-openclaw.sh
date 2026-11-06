@@ -60,7 +60,7 @@ SETUP_SCRIPT="${SCRIPTS_DIR}/setup-openclaw-triad.sh"
 MAKEFILE_PATH="${ORCHESTRATE_DIR}/Makefile"
 
 # --- Pinned recipe fetching -------------------------------------------------
-PINNED_TAG="${OPENCLAW_PINNED_TAG:-20261106-1428}"
+PINNED_TAG="${OPENCLAW_PINNED_TAG:-20261106-1549}"
 FETCH_REPO_BASE="https://raw.githubusercontent.com/nolim1t/openclaw-orchestrate/refs/tags/${PINNED_TAG}"
 FETCH_MODE="${OPENCLAW_FETCH_MODE:-auto}"   # auto | always | never
 
