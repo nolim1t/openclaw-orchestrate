@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
 #
-# setup-openclaw-triad.sh  (v2 — roster-driven)
+# setup-openclaw-triad.sh  (v2.2 — roster-driven, Bash 3.2 SAFE)
 # Portable, parameterized OpenClaw triad workspace builder
+#
+# v2.2 CHANGELOG (vs v2.1):
+#   - Removed all nested $(...)/[[...]] constructs from INSIDE heredocs.
+#     Bash 3.2 misparses complex command substitutions in unquoted heredocs,
+#     which produced phantom-quote parse errors far downstream (e.g. at the
+#     harmless "ok trading.json" line). Every value is now precomputed into
+#     a plain variable BEFORE the heredoc; heredocs reference ${var} only.
+#
+# COMPATIBILITY: macOS stock Bash 3.2 (no ${var,,}/${var^^}/${var^},
+# no associative arrays, no heredoc-embedded compound substitutions).
 #
 # USAGE:
 #   ./setup-openclaw-triad.sh                        # Auto-detect features from env
@@ -41,9 +51,10 @@ CONTAINER_STATE_DIR="${CONTAINER_STATE_DIR:-${CONTAINER_HOME}/.openclaw}"
 PERSONALITY_PRESET="${PERSONALITY_PRESET:-default}"
 AGENT_ROSTER="${AGENT_ROSTER:-clawdia,clawdio,arbiter}"
 
-# Normalise roster: trim spaces, lowercase, dedupe, keep order
+# Normalise roster: trim spaces, lowercase (Bash 3.2-safe: no ${var,,})
 ROSTER_RAW="${AGENT_ROSTER// /}"
-IFS=',' read -ra ROSTER <<< "${ROSTER_RAW,,}"
+ROSTER_LOWER="$(printf '%s' "$ROSTER_RAW" | tr '[:upper:]' '[:lower:]')"
+IFS=',' read -ra ROSTER <<< "$ROSTER_LOWER"
 
 if [[ ${#ROSTER[@]} -ne 3 ]]; then
     echo "ERROR: AGENT_ROSTER must contain exactly 3 comma-separated names (got: ${AGENT_ROSTER})." >&2
@@ -60,9 +71,17 @@ SCOUT="${ROSTER[0]}"
 RISK="${ROSTER[1]}"
 JUDGE="${ROSTER[2]}"
 
-upper() { echo "${1^^}" | tr '-' '_'; }
+# --- Case-conversion helpers (Bash 3.2-safe: tr + awk) ------------------------
+upcase()     { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+upper()      { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr '-' '_'; }
+capitalize() { printf '%s' "$1" | awk '{print toupper(substr($0,1,1)) substr($0,2)}'; }
 
-# --- Preset packs: theme / role / model / thinking per POSITION --------------
+# Precomputed uppercase IDs — used inside heredocs (NO $( ) calls in heredocs)
+SCOUT_U="$(upper "$SCOUT")"
+RISK_U="$(upper "$RISK")"
+JUDGE_U="$(upper "$JUDGE")"
+
+# --- Preset packs: theme / role per POSITION ---------------------------------
 case "$PERSONALITY_PRESET" in
     default)
         P_SCOUT_THEME="sassy oracle — purple holographic fox, crimson claws"
@@ -150,7 +169,7 @@ BASE_IMAGE="${BASE_IMAGE:-python:3.11-slim}"
 ###############################################################################
 
 usage() {
-    cat << 'EOF'
+    cat << 'USAGEEOF'
 Usage: ./setup-openclaw-triad.sh [OPTIONS]
 
 Options:
@@ -176,22 +195,30 @@ Required:
 Optional (auto-enable when set):
   ELEVENLABS_API_KEY, TELEGRAM_BOT_TOKEN,
   POLYMARKET_API_KEY, WALLET_PRIVATE_KEY
-EOF
+USAGEEOF
     exit 0
 }
 
-step() { printf '\n\033[1m▸ %s\033[0m\n' "$1"; }
-ok()   { printf '   ✓ %s\n' "$1"; }
-warn() { printf '   ⚠ %s\n' "$1"; }
-skip() { printf '   – %s\n' "$1"; }
+step() { printf '\n[>] %s\n' "$1"; }
+ok()   { printf '   [ok] %s\n' "$1"; }
+warn() { printf '   [!!] %s\n' "$1"; }
+skip() { printf '   [--] %s\n' "$1"; }
 
 in_roster() { local n; for n in "${ROSTER[@]}"; do [[ "$n" == "$1" ]] && return 0; done; return 1; }
 
 detect_features() {
-    [[ "$USE_ELEVENLABS" == "auto" ]] && USE_ELEVENLABS=$( [[ -n "${ELEVENLABS_API_KEY:-}" ]] && echo true || echo false )
-    [[ "$USE_TELEGRAM"   == "auto" ]] && USE_TELEGRAM=$(   [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && echo true || echo false )
-    [[ "$USE_POLYMARKET" == "auto" ]] && USE_POLYMARKET=$( [[ -n "${POLYMARKET_API_KEY:-}" ]] && echo true || echo false )
-    [[ "$USE_WALLET"     == "auto" ]] && USE_WALLET=$(     [[ -n "${WALLET_PRIVATE_KEY:-}" ]] && echo true || echo false )
+    if [[ "$USE_ELEVENLABS" == "auto" ]]; then
+        if [[ -n "${ELEVENLABS_API_KEY:-}" ]]; then USE_ELEVENLABS=true; else USE_ELEVENLABS=false; fi
+    fi
+    if [[ "$USE_TELEGRAM" == "auto" ]]; then
+        if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then USE_TELEGRAM=true; else USE_TELEGRAM=false; fi
+    fi
+    if [[ "$USE_POLYMARKET" == "auto" ]]; then
+        if [[ -n "${POLYMARKET_API_KEY:-}" ]]; then USE_POLYMARKET=true; else USE_POLYMARKET=false; fi
+    fi
+    if [[ "$USE_WALLET" == "auto" ]]; then
+        if [[ -n "${WALLET_PRIVATE_KEY:-}" ]]; then USE_WALLET=true; else USE_WALLET=false; fi
+    fi
 }
 
 validate_config() {
@@ -203,7 +230,7 @@ validate_config() {
         ok "NanoGPT key present"
     fi
 
-    ok "Roster: ${SCOUT} (scout) · ${RISK} (risk) · ${JUDGE} (arbiter)"
+    ok "Roster: ${SCOUT} (scout) / ${RISK} (risk) / ${JUDGE} (arbiter)"
     ok "Preset: ${PERSONALITY_PRESET}"
 
     if [[ "$USE_WALLET" == "true" ]]; then
@@ -215,7 +242,8 @@ validate_config() {
             warn "WALLET_AGENT '$WALLET_AGENT' not in roster — falling back to ${RISK}"
             WALLET_AGENT="$RISK"
         fi
-        ok "Wallet: ${WALLET_TYPE^^} held by ${WALLET_AGENT}"
+        WALLET_TYPE_U="$(upcase "$WALLET_TYPE")"
+        ok "Wallet: ${WALLET_TYPE_U} held by ${WALLET_AGENT}"
     fi
 
     return 0
@@ -238,37 +266,49 @@ create_directory_structure() {
     done
 
     # Role-specific working directories (by POSITION, not name)
-    mkdir -p "${WORKSPACE_ROOT}/${SCOUT}/analysis"/{setups,patterns}
-    mkdir -p "${WORKSPACE_ROOT}/${RISK}"/{risk-model/historical-setups,veto-log,audits/weekly}
-    mkdir -p "${WORKSPACE_ROOT}/${JUDGE}"/{rulings,dispute-archive,drift-watch}
+    mkdir -p "${WORKSPACE_ROOT}/${SCOUT}/analysis/setups"
+    mkdir -p "${WORKSPACE_ROOT}/${SCOUT}/analysis/patterns"
+    mkdir -p "${WORKSPACE_ROOT}/${RISK}/risk-model/historical-setups"
+    mkdir -p "${WORKSPACE_ROOT}/${RISK}/veto-log"
+    mkdir -p "${WORKSPACE_ROOT}/${RISK}/audits/weekly"
+    mkdir -p "${WORKSPACE_ROOT}/${JUDGE}/rulings"
+    mkdir -p "${WORKSPACE_ROOT}/${JUDGE}/dispute-archive"
+    mkdir -p "${WORKSPACE_ROOT}/${JUDGE}/drift-watch"
 
     if [[ "$USE_WALLET" == "true" ]]; then
         mkdir -p "${WORKSPACE_ROOT}/${WALLET_AGENT}/wallet"
     fi
 
-    mkdir -p "${PLUGINS_DIR}/polymarket-clob"/{src,tests,fixtures}
-    mkdir -p "${SHARED_DIR}"/{calibration,state}
+    mkdir -p "${PLUGINS_DIR}/polymarket-clob/src"
+    mkdir -p "${PLUGINS_DIR}/polymarket-clob/tests"
+    mkdir -p "${PLUGINS_DIR}/polymarket-clob/fixtures"
+    mkdir -p "${SHARED_DIR}/calibration"
+    mkdir -p "${SHARED_DIR}/state"
     mkdir -p "${LOGS_DIR}" "${HELPERS_DIR}"
 
     ok "Tree created under ${STATE_DIR}"
 }
 
 ###############################################################################
-# OPENCLAW.JSON
+# OPENCLAW.JSON — all values precomputed; heredocs reference plain vars only
 ###############################################################################
 
 generate_openclaw_json() {
     step "Generating openclaw.json"
 
-    local json_agents="" agent entry tools_allow tools_deny tts_block
+    local json_agents="" agent display entry
+    local tools_allow tools_deny subagents_str tts_block
+    local agent_model agent_think agent_theme
+    local i voice_var voice_id
 
     for i in 1 2 3; do
         agent="${ROSTER[$((i-1))]}"
+        display="$(capitalize "$agent")"
+        agent_model="$(get_model "$agent" "$i")"
+        agent_think="$(get_think "$agent" "$i")"
+        agent_theme="$(get_theme "$agent" "$i")"
 
-        # Governance enforced by position:
-        #   scout & risk: read/write/exec/message (+ history introspection)
-        #   judge: READ + message only — a mediator who can edit the record
-        #          is not a mediator.
+        # Governance enforced by position (computed OUTSIDE any heredoc):
         if [[ $i -lt 3 ]]; then
             tools_allow='["read", "write", "edit", "exec", "message", "sessions_list", "sessions_history"]'
             tools_deny='["apply_patch", "browser", "gateway", "canvas", "nodes"]'
@@ -277,50 +317,56 @@ generate_openclaw_json() {
             tools_deny='["write", "edit", "apply_patch", "exec", "process", "browser", "gateway", "canvas", "nodes", "cron"]'
         fi
 
+        # Sub-agents: only the scout may delegate. Precomputed as plain string.
+        if [[ $i -eq 1 ]]; then
+            subagents_str="\"${RISK}\", \"${JUDGE}\""
+        else
+            subagents_str=""
+        fi
+
+        # TTS block (precomputed)
         tts_block=""
         if [[ "$USE_ELEVENLABS" == "true" ]]; then
-            local voice_var="ELEVENLABS_VOICE_ID_$(upper "$agent")"
-            local voice_id="${!voice_var:-${ELEVENLABS_VOICE_ID:-default}}"
+            voice_var="ELEVENLABS_VOICE_ID_$(upper "$agent")"
+            voice_id="$(eval "echo \"\${${voice_var}:-${ELEVENLABS_VOICE_ID:-default}}\"")"
             tts_block=$(printf ',\n        "tts": { "providers": { "elevenlabs": { "speakerVoiceId": "%s" } } }' "$voice_id")
         fi
 
-        # Display name: capitalise first letter
-        local display
-        display="$(printf '%s' "$agent" | sed 's/^./\U&/')"
-
-        entry=$(cat << EOF
+        entry=$(cat << ENTRYEOF
       ${agent}: {
         name: "${display}",
         workspace: "${WORKSPACE_ROOT}/${agent}",
         agentDir: "${AGENTS_ROOT}/${agent}/agent",
         model: {
-          primary: "$(get_model "$agent" "$i")",
+          primary: "${agent_model}",
           fallbacks: ["${UTILITY_MODEL}"]
         },
         utilityModel: "${UTILITY_MODEL}",
-        thinkingDefault: "$(get_think "$agent" "$i")",
+        thinkingDefault: "${agent_think}",
         reasoningDefault: "on",
         fastModeDefault: false,
         identity: {
           name: "${display}",
-          theme: "$(get_theme "$agent" "$i")"
+          theme: "${agent_theme}"
         },
         tools: {
           allow: ${tools_allow},
           deny: ${tools_deny}
         },
-        subagents: { allowAgents: $( [[ $i -eq 1 ]] && echo '["'"${RISK}"'", "'"${JUDGE}"'"]' || echo '[]' ) },
+        subagents: { allowAgents: [${subagents_str}] },
         sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" }${tts_block}
       }
-EOF
+ENTRYEOF
 )
-        [[ -n "$json_agents" ]] && json_agents+=","$'\n'
-        json_agents+="$entry"
+        if [[ -n "$json_agents" ]]; then
+            json_agents="${json_agents},"$'\n'
+        fi
+        json_agents="${json_agents}${entry}"
     done
 
-    cat > "${STATE_DIR}/openclaw.json" << EOF
+    cat > "${STATE_DIR}/openclaw.json" << JSONEOF
 // ${STATE_DIR}/openclaw.json
-// Generated by setup-openclaw-triad.sh (v2) on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+// Generated by setup-openclaw-triad.sh (v2.2) on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 // Format: JSON5 (comments + trailing commas permitted)
 
 {
@@ -356,7 +402,7 @@ ${json_agents}
   memory: { enabled: true },
   web: { enabled: true }
 }
-EOF
+JSONEOF
 
     ok "openclaw.json (paths resolved to ${STATE_DIR})"
 }
@@ -382,7 +428,7 @@ generate_trading_json() {
 
     mkdir -p "${PLUGINS_DIR}/polymarket-clob"
 
-    cat > "${PLUGINS_DIR}/polymarket-clob/trading.json" << EOF
+    cat > "${PLUGINS_DIR}/polymarket-clob/trading.json" << TRADEEOF
 {
   "mode": "testnet",
   "exchange": "polymarket_clob",
@@ -412,19 +458,19 @@ generate_trading_json() {
     "incident_log_path": "${LOGS_DIR}/incidents.log"
   }
 }
-EOF
+TRADEEOF
 
-    ok "trading.json (mode: testnet, preset: ${PERSONALITY_PRESET})"
+    ok "trading.json — mode: testnet, preset: ${PERSONALITY_PRESET}"
 }
 
 ###############################################################################
-# ENV TEMPLATE
+# ENV TEMPLATE — uppercase IDs precomputed (SCOUT_U/RISK_U/JUDGE_U)
 ###############################################################################
 
 generate_env_template() {
     step "Generating .env template"
 
-    cat > "${STATE_DIR}/.env.example" << EOF
+    cat > "${STATE_DIR}/.env.example" << ENVEOF
 # =============================================================================
 # REQUIRED
 # =============================================================================
@@ -438,21 +484,21 @@ PERSONALITY_PRESET=${PERSONALITY_PRESET}
 AGENT_ROSTER=${SCOUT},${RISK},${JUDGE}
 
 # Per-agent overrides (uncomment to use)
-# AGENT_$(upper "${SCOUT}")_THEME=
-# AGENT_$(upper "${SCOUT}")_ROLE=
-# AGENT_$(upper "${SCOUT}")_MODEL=
-# AGENT_$(upper "${SCOUT}")_THINKING=medium
-# AGENT_$(upper "${RISK}")_THINKING=high
-# AGENT_$(upper "${JUDGE}")_THINKING=high
+# AGENT_${SCOUT_U}_THEME=
+# AGENT_${SCOUT_U}_ROLE=
+# AGENT_${SCOUT_U}_MODEL=
+# AGENT_${SCOUT_U}_THINKING=medium
+# AGENT_${RISK_U}_THINKING=high
+# AGENT_${JUDGE_U}_THINKING=high
 
 # =============================================================================
 # OPTIONAL FEATURES (auto-enable when set)
 # =============================================================================
 # ELEVENLABS_API_KEY=
 # ELEVENLABS_VOICE_ID=
-# ELEVENLABS_VOICE_ID_$(upper "${SCOUT}")=
-# ELEVENLABS_VOICE_ID_$(upper "${RISK}")=
-# ELEVENLABS_VOICE_ID_$(upper "${JUDGE}")=
+# ELEVENLABS_VOICE_ID_${SCOUT_U}=
+# ELEVENLABS_VOICE_ID_${RISK_U}=
+# ELEVENLABS_VOICE_ID_${JUDGE_U}=
 # TELEGRAM_BOT_TOKEN=
 # TELEGRAM_USER_ID=
 # POLYMARKET_API_KEY=
@@ -465,7 +511,7 @@ AGENT_ROSTER=${SCOUT},${RISK},${JUDGE}
 # WALLET_TYPE=btc        # btc | xmr | eth
 # WALLET_PRIVATE_KEY=
 # WALLET_AGENT=${RISK}
-EOF
+ENVEOF
 
     if [[ ! -f "${STATE_DIR}/.env" ]]; then
         cp "${STATE_DIR}/.env.example" "${STATE_DIR}/.env"
@@ -476,7 +522,7 @@ EOF
 }
 
 ###############################################################################
-# AGENT WORKSPACE FILES
+# AGENT WORKSPACE FILES — all substitutions precomputed before heredocs
 ###############################################################################
 
 temperament_note() {
@@ -511,16 +557,27 @@ temperament_note() {
 generate_agent_files() {
     step "Generating agent workspace files"
 
+    local agent display model thinking theme role position_label temperament
+    local i
+
     for i in 1 2 3; do
-        local agent="${ROSTER[$((i-1))]}"
-        local display model thinking theme role
-        display="$(printf '%s' "$agent" | sed 's/^./\U&/')"
+        agent="${ROSTER[$((i-1))]}"
+        display="$(capitalize "$agent")"
         model="$(get_model "$agent" "$i")"
         thinking="$(get_think "$agent" "$i")"
         theme="$(get_theme "$agent" "$i")"
         role="$(get_role "$agent" "$i")"
 
-        cat > "${WORKSPACE_ROOT}/${agent}/IDENTITY.md" << EOF
+        # Position label — precomputed (was a nested $([[ ]]) inside heredoc in v2.1)
+        case $i in
+            1) position_label="1 of 3 — scout" ;;
+            2) position_label="2 of 3 — risk" ;;
+            3) position_label="3 of 3 — arbiter (read-only)" ;;
+        esac
+
+        temperament="$(temperament_note)"
+
+        cat > "${WORKSPACE_ROOT}/${agent}/IDENTITY.md" << IDEOF
 # IDENTITY.md — ${display}
 
 **Runtime:** OpenClaw Triad
@@ -528,24 +585,24 @@ generate_agent_files() {
 **Model:** \`${model}\`
 **Thinking:** \`${thinking}\`
 **Preset:** \`${PERSONALITY_PRESET}\`
-**Position:** $([[ $i -eq 1 ]] && echo "1 of 3 — scout")$([[ $i -eq 2 ]] && echo "2 of 3 — risk")$([[ $i -eq 3 ]] && echo "3 of 3 — arbiter (read-only)")
+**Position:** ${position_label}
 **Workspace:** \`${WORKSPACE_ROOT}/${agent}\`
 **Generated:** $(date -u +"%Y-%m-%d")
 
 ---
 
 See \`SOUL.md\` for temperament and \`AGENTS.md\` for role and protocol.
-EOF
+IDEOF
 
-        cat > "${WORKSPACE_ROOT}/${agent}/AGENTS.md" << EOF
-# AGENTS.md — ${display}'s Role
+        cat > "${WORKSPACE_ROOT}/${agent}/AGENTS.md" << AGEOF
+# AGENTS.md — ${display} Role
 
 | Field | Value |
 |---|---|
 | Agent id | \`${agent}\` |
 | Model | \`${model}\` |
 | Thinking | \`${thinking}\` |
-| Position | $i of 3 |
+| Position | ${position_label} |
 | Workspace | \`${WORKSPACE_ROOT}/${agent}\` |
 | State dir | \`${AGENTS_ROOT}/${agent}/agent\` |
 
@@ -556,23 +613,23 @@ EOF
 Governance: no single agent executes alone. Alignment between ${SCOUT} and
 ${RISK} authorises execution; disagreement escalates to ${JUDGE}, whose
 ruling is binding. This invariant holds regardless of agent names.
-EOF
+AGEOF
 
-        cat > "${WORKSPACE_ROOT}/${agent}/SOUL.md" << EOF
+        cat > "${WORKSPACE_ROOT}/${agent}/SOUL.md" << SOULEOF
 # SOUL.md — ${display}
 
 **Theme:** ${theme}
 
 ## Temperament
-$(temperament_note)
+${temperament}
 
 ## Calibration targets
-- Hit rate tracked in \`shared/calibration/${agent}-hunches.csv\`
+- Hit rate tracked in \`shared/calibration/${agent}-decisions.csv\`
 - Reviewed weekly alongside the other two agents
 - Miscalibration noted in \`journal/\`, never silently corrected
-EOF
+SOULEOF
 
-        cat > "${WORKSPACE_ROOT}/${agent}/DREAMS.md" << EOF
+        cat > "${WORKSPACE_ROOT}/${agent}/DREAMS.md" << DRMEOF
 # DREAMS.md — ${display}
 
 Milestone ladder — do not skip rungs.
@@ -587,10 +644,10 @@ Milestone ladder — do not skip rungs.
 - What did I get wrong that calibration data exposed?
 - Where did temperament leak into judgement?
 - What would the other two agents say I missed?
-EOF
+DRMEOF
 
         touch "${WORKSPACE_ROOT}/${agent}/journal/$(date +%Y-%m-%d).md"
-        ok "${display} (pos $i · ${model})"
+        ok "${display} (pos ${i} / ${model})"
     done
 }
 
@@ -601,26 +658,25 @@ EOF
 generate_shared_data() {
     step "Initialising shared data"
 
-    cat > "${SHARED_DIR}/trade-ledger.jsonl" << 'EOF'
+    cat > "${SHARED_DIR}/trade-ledger.jsonl" << 'LEDGEREOF'
 # Append-only trade ledger. One JSON object per line.
 # Written by the plugin, never by agents directly.
-EOF
+LEDGEREOF
 
     echo '{}' > "${SHARED_DIR}/state/daily-counters.json"
 
-    cat > "${SHARED_DIR}/calibration/README.md" << EOF
+    cat > "${SHARED_DIR}/calibration/README.md" << 'CALREADMEEOF'
 # Calibration Archive
 
 Tracks each agent's accuracy over time.
 
 | File | Measures |
 |---|---|
-EOF
+CALREADMEEOF
     for agent in "${ROSTER[@]}"; do
         echo "| \`${agent}-decisions.csv\` | ${agent} decision accuracy by setup category |" >> "${SHARED_DIR}/calibration/README.md"
     done
-    echo "
-Reviewed weekly." >> "${SHARED_DIR}/calibration/README.md"
+    printf '\nReviewed weekly.\n' >> "${SHARED_DIR}/calibration/README.md"
 
     ok "ledger, counters, calibration"
 }
@@ -635,11 +691,11 @@ generate_wallet_integration() {
         return
     fi
 
-    step "Generating ${WALLET_TYPE^^} treasury for ${WALLET_AGENT}"
+    step "Generating ${WALLET_TYPE_U} treasury for ${WALLET_AGENT}"
 
     mkdir -p "${WORKSPACE_ROOT}/${WALLET_AGENT}/wallet"
 
-    cat > "${WORKSPACE_ROOT}/${WALLET_AGENT}/wallet/config.json" << EOF
+    cat > "${WORKSPACE_ROOT}/${WALLET_AGENT}/wallet/config.json" << WALLEOF
 {
   "enabled": true,
   "type": "${WALLET_TYPE}",
@@ -661,13 +717,13 @@ generate_wallet_integration() {
     "on_withdrawal_request": true
   }
 }
-EOF
+WALLEOF
 
     ok "wallet config for ${WALLET_AGENT}"
 }
 
 ###############################################################################
-# CONDITIONAL: TELEGRAM (command list derives from roster)
+# CONDITIONAL: TELEGRAM (commands derive from roster)
 ###############################################################################
 
 generate_telegram_bot() {
@@ -680,14 +736,9 @@ generate_telegram_bot() {
 
     mkdir -p "${PLUGINS_DIR}/telegram-bot"
 
-    local cmd_help=""
-    for agent in "${ROSTER[@]}"; do
-        cmd_help+="\\\"/${agent}\\\" — ${agent}\\n"
-    done
-
-    cat > "${PLUGINS_DIR}/telegram-bot/bot.py" << PYEOF
+    cat > "${PLUGINS_DIR}/telegram-bot/bot.py" << 'BOTPYEOF'
 #!/usr/bin/env python3
-"""Telegram front-end for the OpenClaw triad (roster: ${SCOUT}, ${RISK}, ${JUDGE})."""
+"""Telegram front-end for the OpenClaw triad."""
 
 import logging
 import os
@@ -704,18 +755,21 @@ log = logging.getLogger("openclaw.telegram")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED = {u.strip() for u in os.environ.get("TELEGRAM_USER_ID", "").split(",") if u.strip()}
-ROSTER = [a.strip() for a in os.environ.get("AGENT_ROSTER", "${SCOUT},${RISK},${JUDGE}").split(",") if a.strip()]
+ROSTER = [a.strip() for a in os.environ.get("AGENT_ROSTER", "").split(",") if a.strip()]
+
+if not ROSTER:
+    ROSTER = ["clawdia", "clawdio", "arbiter"]
 
 
-def authorised(update: Update) -> bool:
+def authorised(update):
     return str(update.effective_user.id) in ALLOWED
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorised(update):
         return
-    lines = "\\n".join(f"/{a} — talk to {a}" for a in ROSTER)
-    await update.message.reply_text(f"OpenClaw triad online.\\n{lines}")
+    lines = "\n".join("/{a} — talk to {a}".format(a=a) for a in ROSTER)
+    await update.message.reply_text("OpenClaw triad online.\n" + lines)
 
 
 async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -741,9 +795,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-PYEOF
+BOTPYEOF
 
-    ok "telegram bot scaffold (${SCOUT}/${RISK}/${JUDGE} commands)"
+    ok "telegram bot scaffold (${SCOUT}/${RISK}/${JUDGE} commands via AGENT_ROSTER)"
 }
 
 ###############################################################################
@@ -759,6 +813,7 @@ generate_docker_config() {
     step "Generating Docker configuration"
 
     local host_state host_workspace host_agents host_shared host_logs host_plugins
+    local app_uid app_gid now
     host_state="$(cd "${STATE_DIR}" && pwd)"
     host_workspace="${host_state}/workspace-triad"
     host_agents="${host_state}/agents"
@@ -766,12 +821,12 @@ generate_docker_config() {
     host_logs="${host_state}/logs"
     host_plugins="${host_state}/plugins"
 
-    local app_uid app_gid
     app_uid="$(id -u)"
     app_gid="$(id -g)"
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-    cat > "${STATE_DIR}/docker.env" << EOF
-# Docker Compose interpolation — generated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    cat > "${STATE_DIR}/docker.env" << DOCKENVEOF
+# Docker Compose interpolation — generated ${now}
 # Contains no secrets. Safe to commit.
 
 COMPOSE_PROJECT_NAME=openclaw-triad
@@ -793,9 +848,9 @@ APP_GID=${app_gid}
 
 CONTAINER_MEM_LIMIT=1g
 CONTAINER_CPUS=1.0
-EOF
+DOCKENVEOF
 
-    cat > "${STATE_DIR}/docker-compose.yml" << 'EOF'
+    cat > "${STATE_DIR}/docker-compose.yml" << 'COMPOSEEOF'
 name: ${COMPOSE_PROJECT_NAME:-openclaw-triad}
 
 services:
@@ -865,11 +920,11 @@ services:
 networks:
   openclaw-net:
     driver: bridge
-EOF
+COMPOSEEOF
 
-    cat > "${STATE_DIR}/Dockerfile" << EOF
+    cat > "${STATE_DIR}/Dockerfile" << 'DOCKERFILEEOF'
 # syntax=docker/dockerfile:1
-# Generated by setup-openclaw-triad.sh (v2)
+# Generated by setup-openclaw-triad.sh (v2.2)
 
 ARG BASE_IMAGE=python:3.11-slim
 ARG CONTAINER_HOME=/home/openclaw
@@ -877,32 +932,32 @@ ARG CONTAINER_STATE_DIR=/home/openclaw/.openclaw
 ARG APP_UID=1000
 ARG APP_GID=1000
 
-FROM \${BASE_IMAGE}
+FROM ${BASE_IMAGE}
 
 ARG CONTAINER_HOME
 ARG CONTAINER_STATE_DIR
 ARG APP_UID
 ARG APP_GID
 
-ENV PYTHONUNBUFFERED=1 \\
-    PYTHONDONTWRITEBYTECODE=1 \\
-    PIP_NO_CACHE_DIR=1 \\
-    HOME=\${CONTAINER_HOME} \\
-    OPENCLAW_STATE_DIR=\${CONTAINER_STATE_DIR} \\
-    OPENCLAW_CONFIG_PATH=\${CONTAINER_STATE_DIR}/openclaw.json \\
-    PATH=\${CONTAINER_HOME}/.local/bin:\${PATH}
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=${CONTAINER_HOME} \
+    OPENCLAW_STATE_DIR=${CONTAINER_STATE_DIR} \
+    OPENCLAW_CONFIG_PATH=${CONTAINER_STATE_DIR}/openclaw.json \
+    PATH=${CONTAINER_HOME}/.local/bin:${PATH}
 
-RUN groupadd --gid "\${APP_GID}" openclaw \\
- && useradd --uid "\${APP_UID}" --gid "\${APP_GID}" \\
-            --create-home --home-dir "\${CONTAINER_HOME}" \\
-            --shell /bin/bash openclaw \\
- && mkdir -p "\${CONTAINER_STATE_DIR}" \\
- && chown -R "\${APP_UID}:\${APP_GID}" "\${CONTAINER_HOME}"
+RUN groupadd --gid "${APP_GID}" openclaw \
+ && useradd --uid "${APP_UID}" --gid "${APP_GID}" \
+            --create-home --home-dir "${CONTAINER_HOME}" \
+            --shell /bin/bash openclaw \
+ && mkdir -p "${CONTAINER_STATE_DIR}" \
+ && chown -R "${APP_UID}:${APP_GID}" "${CONTAINER_HOME}"
 
-WORKDIR \${CONTAINER_HOME}
+WORKDIR ${CONTAINER_HOME}
 
-COPY --chown=\${APP_UID}:\${APP_GID} requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --requirement /tmp/requirements.txt \\
+COPY --chown=${APP_UID}:${APP_GID} requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --requirement /tmp/requirements.txt \
  && rm -f /tmp/requirements.txt
 
 USER openclaw
@@ -911,16 +966,16 @@ USER openclaw
 # method at https://docs.openclaw.ai before relying on this.
 
 CMD ["openclaw", "start"]
-EOF
+DOCKERFILEEOF
 
-    cat > "${STATE_DIR}/requirements.txt" << 'EOF'
+    cat > "${STATE_DIR}/requirements.txt" << 'REQEOF'
 websockets>=12.0
 requests>=2.31.0
 python-telegram-bot>=20.7
 python-dotenv>=1.0.0
-EOF
+REQEOF
 
-    cat > "${STATE_DIR}/.dockerignore" << 'EOF'
+    cat > "${STATE_DIR}/.dockerignore" << 'DIEOF'
 .env
 *.key
 *.pem
@@ -934,29 +989,51 @@ workspace-triad/
 __pycache__/
 tests/
 fixtures/
-EOF
+DIEOF
 
     ok "docker-compose.yml, docker.env, Dockerfile, requirements.txt"
 }
 
 ###############################################################################
-# SUMMARY
+# SUMMARY — all conditionals precomputed, no $( ) inside heredocs
 ###############################################################################
 
 print_summary() {
-    local tick="✓" cross="✗"
-    local f_tts f_tg f_pm f_wal f_doc
-    [[ "$USE_ELEVENLABS" == "true" ]] && f_tts="$tick" || f_tts="$cross"
-    [[ "$USE_TELEGRAM"   == "true" ]] && f_tg="$tick"  || f_tg="$cross"
-    [[ "$USE_POLYMARKET" == "true" ]] && f_pm="$tick"  || f_pm="$cross"
-    [[ "$USE_WALLET"     == "true" ]] && f_wal="$tick" || f_wal="$cross"
-    [[ "$DOCKER_ENABLE"  == "true" ]] && f_doc="$tick" || f_doc="$cross"
+    local f_tts="[x]" f_tg="[x]" f_pm="[x]" f_wal="[x]" f_doc="[x]"
+    local wallet_extra="" docker_block="" model_lines="" agent agent_model i
 
-    cat << EOF
+    if [[ "$USE_ELEVENLABS" == "true" ]]; then f_tts="[ok]"; else f_tts="[--]"; fi
+    if [[ "$USE_TELEGRAM"   == "true" ]]; then f_tg="[ok]";   else f_tg="[--]"; fi
+    if [[ "$USE_POLYMARKET" == "true" ]]; then f_pm="[ok]";   else f_pm="[--]"; fi
+    if [[ "$USE_WALLET"     == "true" ]]; then f_wal="[ok]";   else f_wal="[--]"; fi
+    if [[ "$DOCKER_ENABLE"  == "true" ]]; then f_doc="[ok]";   else f_doc="[--]"; fi
 
-════════════════════════════════════════════════════════
+    if [[ "$USE_WALLET" == "true" ]]; then
+        wallet_extra="  (${WALLET_TYPE_U} / ${WALLET_AGENT})"
+    fi
+
+    if [[ "$DOCKER_ENABLE" == "true" ]]; then
+        docker_block="
+  Docker
+    cd ${STATE_DIR}
+    docker compose --env-file docker.env build
+    docker compose --env-file docker.env up -d"
+    fi
+
+    for i in 1 2 3; do
+        agent="${ROSTER[$((i-1))]}"
+        agent_model="$(get_model "$agent" "$i")"
+        model_lines="${model_lines}
+    ${agent}: ${agent_model}"
+    done
+    model_lines="${model_lines}
+    utility: ${UTILITY_MODEL}"
+
+    cat << SUMEOF
+
+======================================================
   SETUP COMPLETE
-════════════════════════════════════════════════════════
+======================================================
 
   State directory   ${STATE_DIR}
   Preset            ${PERSONALITY_PRESET}
@@ -967,39 +1044,23 @@ print_summary() {
     3. ${JUDGE}   (arbiter — read-only rulings)
 
   Features
-    NanoGPT API        ✓  (required)
+    NanoGPT API        [ok] (required)
     ElevenLabs TTS     ${f_tts}
     Telegram bot       ${f_tg}
     Polymarket CLOB    ${f_pm}
-    Crypto treasury    ${f_wal}$( [[ "$USE_WALLET" == "true" ]] && echo "  (${WALLET_TYPE^^} · ${WALLET_AGENT})" )
+    Crypto treasury    ${f_wal}${wallet_extra}
     Docker             ${f_doc}
 
-  Models
-EOF
-    for i in 1 2 3; do
-        local agent="${ROSTER[$((i-1))]}"
-        printf '    %-12s %s\n' "${agent}" "$(get_model "$agent" "$i")"
-    done
-    printf '    %-12s %s\n' "utility" "${UTILITY_MODEL}"
-
-    cat << EOF
+  Models:${model_lines}
+${docker_block}
 
   Next
     1. Fill in ${STATE_DIR}/.env
     2. openclaw config schema
     3. openclaw start
-EOF
 
-    if [[ "$DOCKER_ENABLE" == "true" ]]; then
-        cat << EOF
-  Docker
-    cd ${STATE_DIR}
-    docker compose --env-file docker.env build
-    docker compose --env-file docker.env up -d
-EOF
-    fi
-
-    echo "════════════════════════════════════════════════════════"
+======================================================
+SUMEOF
 }
 
 ###############################################################################
