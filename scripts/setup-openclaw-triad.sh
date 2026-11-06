@@ -38,6 +38,8 @@ HELPERS_DIR="${STATE_DIR}/helpers"
 
 CONTAINER_HOME="${CONTAINER_HOME:-/home/openclaw}"
 CONTAINER_STATE_DIR="${CONTAINER_STATE_DIR:-${CONTAINER_HOME}/.openclaw}"
+CONTAINER_AGENTS_ROOT="${CONTAINER_STATE_DIR}/agents"
+CONTAINER_WORKSPACE_ROOT="${CONTAINER_STATE_DIR}/workspace-triad"
 
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-latest}"
 BASE_IMAGE="${BASE_IMAGE:-node:24-slim}"
@@ -339,8 +341,8 @@ generate_openclaw_json() {
         entry=$(cat << ENTRYEOF
       ${agent}: {
         name: "${display}",
-        workspace: "${WORKSPACE_ROOT}/${agent}",
-        agentDir: "${AGENTS_ROOT}/${agent}/agent",
+        workspace: "${CONTAINER_WORKSPACE_ROOT}/${agent}",
+        agentDir: "${CONTAINER_AGENTS_ROOT}/${agent}/agent",
         model: {
           primary: "${agent_model}",
           fallbacks: ["${UTILITY_MODEL}"]
@@ -377,8 +379,8 @@ ENTRYEOF
   agents: {
     ownership: "explicit",
     defaults: {
-      workspace: "${WORKSPACE_ROOT}",
-      cwd: "${WORKSPACE_ROOT}",
+      workspace: "${CONTAINER_WORKSPACE_ROOT}",
+      cwd: "${CONTAINER_WORKSPACE_ROOT}",
       systemAgent: { agentId: "${SCOUT}" },
       heartbeat: { agentId: "${RISK}" },
       authInheritance: { agentId: "${SCOUT}" },
