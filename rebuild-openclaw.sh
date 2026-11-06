@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 #
-# rebuild-openclaw.sh (v1.1)
+# rebuild-openclaw.sh (v1.2)
 # One-command, from-scratch rebuild of the OpenClaw triad stack.
+#
+# CHANGELOG v1.2
+#   - PERIMETER DEFENCE: the script no longer trusts the pinned tag's
+#     generator defaults for critical values. After scrubbing stale
+#     BASE_IMAGE lines from .env it explicitly REWRITES
+#     BASE_IMAGE=node:24-slim (the v1.1 scrub deleted the node override
+#     too, leaving the generator free to fall back to a python default
+#     that lived in the tag — direct cause of the second npm-not-found).
+#   - Post-generation SELF-HEAL: if docker.env or docker-compose.yml
+#     still carries BASE_IMAGE=python after generation, the script
+#     repairs it in place instead of warning.
+#   - PROMOTED INSPECTION: docker.env node-base went from soft "bonus"
+#     check to a HARD, SELF-HEALING check (repairs, then re-verifies;
+#     dies if repair fails).
+#   - Same promotion for the compose mem_limit guard: repairs, re-verifies.
 #
 # CHANGELOG v1.1
 #   - Auto-fetches the PINNED TAG release of the generator (Makefile +
 #     setup-openclaw-triad.sh) from GitHub raw, with runtime validation
-#     (curl + syntax check) and graceful fallback to existing local copies.
-#   - mem_limit auto-bump: exit 137 (SIGKILL/OOM) in crash loops traced to
-#     undersized container memory; script now enforces mem_limit: 2g.
+#     and graceful fallback to existing local copies.
+#   - mem_limit auto-bump: exit 137 (SIGKILL/OOM) crash loops traced to
+#     undersized container memory; enforces mem_limit: 2g.
 #   - Anti-contamination inspection: refuses to build if default-roster
 #     names (clawdia/clawdio/arbiter) appear in config, or if agents/
 #     contains DBs that aren't members of AGENT_ROSTER.
-#   - Prints an "openclaw doctor --fix" recovery command (with the
-#     detected container state path) if the DB integrity gate appears.
+#   - Prints an "openclaw doctor --fix" recovery command if the DB
+#     integrity gate appears.
 #
 # CHANGELOG v1.0
 #   - Initial: backup secrets → teardown → regenerate → five-point
@@ -29,9 +44,6 @@
 # FETCH BEHAVIOUR (env-tunable):
 #   OPENCLAW_PINNED_TAG=20261106-1428   # GitHub tag to pull recipe from
 #   OPENCLAW_FETCH_MODE=auto|always|never
-#        auto   = try fetch, fall back to local copy on failure (default)
-#        always = fetch required — die if the tag is unreachable
-#        never  = never touch the network; local files only
 #
 set -euo pipefail
 
@@ -53,6 +65,8 @@ FETCH_REPO_BASE="https://raw.githubusercontent.com/nolim1t/openclaw-orchestrate/
 FETCH_MODE="${OPENCLAW_FETCH_MODE:-auto}"   # auto | always | never
 
 # --- Runtime guardrails ------------------------------------------------------
+# The ONLY correct base image. Enforced regardless of tag defaults.
+FORCED_BASE_IMAGE="node:24-slim"
 MEM_LIMIT_DESIRED="${OPENCLAW_MEM_LIMIT:-2g}"
 DEFAULT_CONTAINER_STATE_DIR="/home/openclaw/.openclaw"
 
@@ -103,6 +117,13 @@ Memory:
   OPENCLAW_MEM_LIMIT    Container mem_limit to enforce (default: 2g).
                         Exit 137 crash loops were traced to OOM kills.
 
+Defence policy:
+  BASE_IMAGE is FORCED to node:24-slim in .env, docker.env, and any
+  generated compose build args. The pinned tag's generator proved to
+  carry a stale python default; this script no longer trusts tag
+  defaults for this value and self-heals all three locations after
+  generation.
+
 What gets DELETED (irrecoverably):
   - ~/.openclaw/ (all generated config, workspaces, runtime DBs, journals)
   - running openclaw containers + the openclaw-triad image
@@ -111,14 +132,12 @@ What gets DELETED (irrecoverably):
 What gets PRESERVED:
   - ~/.openclaw/.env secrets (backed up to ~/openclaw-env-backup-<date> first)
   - ~/openclaw-orchestrate/ local copies are overwritten by the pinned tag
-    when fetching succeeds (that's the point).
+    when fetching succeeds.
 USAGEEOF
     exit 0
 }
 
 # fetch_pinned <remote-path> <dest> <kind:shell|makefile>
-# Downloads a pinned-tag file, validates it, installs it atomically.
-# Returns 0 on success, 1 on failure (caller decides severity by FETCH_MODE).
 fetch_pinned() {
     local remote="$1" dest="$2" kind="$3"
     local url="${FETCH_REPO_BASE}/${remote}"
@@ -148,8 +167,6 @@ fetch_pinned() {
     return 0
 }
 
-# fetch_required <remote-path> <dest> <kind> <label>
-# Wraps fetch_pinned with FETCH_MODE semantics: dies if 'always'.
 fetch_required() {
     local remote="$1" dest="$2" kind="$3" label="$4"
     if fetch_pinned "$remote" "$dest" "$kind"; then
@@ -161,6 +178,28 @@ fetch_required() {
     else
         die "${label}: fetch failed and no local copy exists at ${dest}"
     fi
+}
+
+# enforce_base_image <file>
+# Guarantees a config-ish file carries BASE_IMAGE=node:24-slim and nothing
+# else for that key. Idempotent: replaces any existing value, appends if
+# absent, strips stray duplicates.
+enforce_base_image() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    if grep -E '^BASE_IMAGE=' "$file" >/dev/null 2>&1; then
+        sed -i '' -E 's/^BASE_IMAGE=.*/BASE_IMAGE='"${FORCED_BASE_IMAGE}"'/' "$file"
+    else
+        echo "BASE_IMAGE=${FORCED_BASE_IMAGE}" >> "$file"
+    fi
+    # collapse duplicate BASE_IMAGE lines to the last one
+    if [[ "$(grep -c '^BASE_IMAGE=' "$file")" -gt 1 ]]; then
+        local tmp_lines
+        tmp_lines="$(grep -v '^BASE_IMAGE=' "$file")"
+        { printf '%s\n' "$tmp_lines"; echo "BASE_IMAGE=${FORCED_BASE_IMAGE}"; } > "$file"
+        warn "collapsed duplicate BASE_IMAGE lines in $(basename "$file")"
+    fi
+    return 0
 }
 
 ###############################################################################
@@ -186,10 +225,9 @@ step "Preflight: fetching pinned recipe (tag ${PINNED_TAG})"
 [[ -d "$ORCHESTRATE_DIR" ]] || mkdir -p "$ORCHESTRATE_DIR"
 [[ -d "$SCRIPTS_DIR" ]]     || mkdir -p "$SCRIPTS_DIR"
 
-fetch_required "Makefile"                     "$MAKEFILE_PATH" "makefile" "Makefile"
-fetch_required "scripts/setup-openclaw-triad.sh" "$SETUP_SCRIPT" "shell"  "Generator script"
+fetch_required "Makefile"                        "$MAKEFILE_PATH" "makefile" "Makefile"
+fetch_required "scripts/setup-openclaw-triad.sh" "$SETUP_SCRIPT"  "shell"   "Generator script"
 
-# Deep validation of what we now have (fetched or local)
 bash -n "$SETUP_SCRIPT" || die "Setup script fails syntax check — fetch produced garbage or local copy is broken."
 GEN_VERSION="$(grep -o 'v2\.[0-9]*' "$SETUP_SCRIPT" | head -1)"
 ok "Generator syntax OK (version marker: ${GEN_VERSION:-unknown})"
@@ -197,8 +235,7 @@ ok "Generator syntax OK (version marker: ${GEN_VERSION:-unknown})"
 if grep -q 'set -a && . ' "$MAKEFILE_PATH"; then
     ok "Makefile is .env-aware (v2)"
 else
-    die "Makefile does NOT source .env (old v1) — roster/preset would be dropped.
-    Fetched tag broken? Check ${MAKEFILE_PATH}."
+    die "Makefile does NOT source .env (old v1) — roster/preset would be dropped."
 fi
 
 command -v docker >/dev/null 2>&1 || die "docker CLI not found on PATH"
@@ -209,6 +246,7 @@ printf '  Recipe source:        %s (mode: %s)\n' "tag ${PINNED_TAG}" "$FETCH_MOD
 printf '  State dir to delete:   %s\n' "$STATE_DIR"
 printf '  Colima VM wiped too:   %s\n' "$FRESH_VM"
 printf '  Secrets backed up to:  %s\n' "${BACKUP_DIR}/openclaw-env-backup-<date>"
+printf '  Forced base image:     %s (tag defaults NOT trusted)\n' "$FORCED_BASE_IMAGE"
 printf '  Mem limit enforced:    %s\n' "$MEM_LIMIT_DESIRED"
 echo
 [[ "$ASSUME_YES" == "true" ]] || confirm "Proceed with complete rebuild?"
@@ -274,10 +312,10 @@ else
 fi
 
 ###############################################################################
-# PHASE 4 — RESTORE SECRETS, SCRUB STALE OVERRIDES
+# PHASE 4 — RESTORE SECRETS, SCRUB, THEN FORCE CRITICAL VALUES
 ###############################################################################
 
-step "Restoring secrets and scrubbing stale overrides"
+step "Restoring secrets, scrubbing stale overrides, forcing critical values"
 
 mkdir -p "$STATE_DIR"
 
@@ -291,34 +329,40 @@ else
     warn "Empty .env created — fill in NANOGPT_API_KEY after generation"
 fi
 
-# Scrub the pre-Node ghost that silently defeats the node:24-slim base.
-if grep -E "^${STALE_PATTERNS}" "$ENV_FILE" >/dev/null 2>&1; then
-    sed -i '' -E "/^${STALE_PATTERNS}/d" "$ENV_FILE"
-    warn "Removed stale BASE_IMAGE override (python base) from .env"
-else
-    ok "No stale BASE_IMAGE overrides in .env"
+# 4a. Scrub the pre-Node ghost: delete ALL BASE_IMAGE lines (stale or not)…
+if grep -E '^BASE_IMAGE=' "$ENV_FILE" >/dev/null 2>&1; then
+    sed -i '' '/^BASE_IMAGE=/d' "$ENV_FILE"
+    ok "Scrubbed existing BASE_IMAGE lines from .env"
 fi
 
-for key in NANOGPT_API_KEY OPENCLAW_GATEWAY_TOKEN AGENT_ROSTER; do
-    if grep -E "^${key}=..+" "$ENV_FILE" >/dev/null 2>&1; then
-        ok "${key} present"
-    else
-        warn "${key} missing/empty"
-    fi
-done
+# 4b. …then FORCE the correct value back in. (v1.1 scrubbed and left a
+# vacuum — the tag's generator refilled it with a python default, and
+# npm vanished at build step 10. Never again: we pin it ourselves.)
+enforce_base_image "$ENV_FILE"
+ok "BASE_IMAGE forced to ${FORCED_BASE_IMAGE} in .env"
 
-if ! grep -E "^OPENCLAW_GATEWAY_TOKEN=..+" "$ENV_FILE" >/dev/null 2>&1; then
+# 4c. Token / roster defaults, same philosophy: force, don't trust.
+if ! grep -E '^OPENCLAW_GATEWAY_TOKEN=..+' "$ENV_FILE" >/dev/null 2>&1; then
     echo "OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)" >> "$ENV_FILE"
     ok "Generated fresh OPENCLAW_GATEWAY_TOKEN"
+else
+    ok "OPENCLAW_GATEWAY_TOKEN present"
 fi
 
-if ! grep -E "^AGENT_ROSTER=..+" "$ENV_FILE" >/dev/null 2>&1; then
+if ! grep -E '^AGENT_ROSTER=..+' "$ENV_FILE" >/dev/null 2>&1; then
     echo "AGENT_ROSTER=seer,guardian,sage" >> "$ENV_FILE"
-    warn "AGENT_ROSTER was empty — defaulted to seer,guardian,sage (old runs defaulted to clawdia-era names)"
+    warn "AGENT_ROSTER was empty — defaulted to seer,guardian,sage"
+else
+    ok "AGENT_ROSTER present: $(grep -E '^AGENT_ROSTER=' "$ENV_FILE" | cut -d= -f2)"
 fi
-if ! grep -E "^PERSONALITY_PRESET=..+" "$ENV_FILE" >/dev/null 2>&1; then
+
+if ! grep -E '^PERSONALITY_PRESET=..+' "$ENV_FILE" >/dev/null 2>&1; then
     echo "PERSONALITY_PRESET=mystic" >> "$ENV_FILE"
     ok "PERSONALITY_PRESET defaulted to mystic"
+fi
+
+if ! grep -E '^NANOGPT_API_KEY=..+' "$ENV_FILE" >/dev/null 2>&1; then
+    warn "NANOGPT_API_KEY missing/empty — agents will not reason until filled"
 fi
 
 ###############################################################################
@@ -331,10 +375,78 @@ step "Generating stack via make setup"
 ok "Generation complete"
 
 ###############################################################################
-# PHASE 6 — SEVEN-POINT INSPECTION (fail-fast BEFORE the expensive build)
+# PHASE 5.5 — SELF-HEAL GENERATED FILES (do NOT trust tag defaults)
 ###############################################################################
 
-step "Seven-point inspection of generated files"
+step "Self-healing generated files against tag defaults"
+
+HEALED=0
+
+# 5.5.1 docker.env: the file compose ACTUALLY interpolates from.
+#       This was the exact location of the python ghost (grep found
+#       BASE_IMAGE=python:3.11-slim on line 6 of a v1.1 run).
+DOCKER_ENV_FILE="${STATE_DIR}/docker.env"
+if [[ -f "$DOCKER_ENV_FILE" ]]; then
+    if grep -E '^BASE_IMAGE=' "$DOCKER_ENV_FILE" >/dev/null 2>&1; then
+        CUR_BASE="$(grep -m1 '^BASE_IMAGE=' "$DOCKER_ENV_FILE" | cut -d= -f2)"
+        if [[ "$CUR_BASE" != "$FORCED_BASE_IMAGE" ]]; then
+            enforce_base_image "$DOCKER_ENV_FILE"
+            warn "docker.env healed: BASE_IMAGE ${CUR_BASE} -> ${FORCED_BASE_IMAGE}"
+            HEALED=$((HEALED + 1))
+        else
+            ok "docker.env BASE_IMAGE already ${FORCED_BASE_IMAGE}"
+        fi
+    else
+        # absent — compose would fall through to .env/ambient; pin it anyway
+        enforce_base_image "$DOCKER_ENV_FILE"
+        warn "docker.env had no BASE_IMAGE — pinned ${FORCED_BASE_IMAGE} defensively"
+        HEALED=$((HEALED + 1))
+    fi
+else
+    warn "docker.env not found after generation — generator layout changed?"
+fi
+
+# 5.5.2 compose build args: belt-and-braces — if the compose file
+#       references ${BASE_IMAGE} as a build arg, docker.env above covers it,
+#       but a hardcoded python string here would bypass everything.
+COMPOSE_FILE="${STATE_DIR}/docker-compose.yml"
+if [[ -f "$COMPOSE_FILE" ]] && grep -q 'python:3.11-slim' "$COMPOSE_FILE"; then
+    sed -i '' 's/python:3.11-slim/node:24-slim/g' "$COMPOSE_FILE"
+    warn "docker-compose.yml healed: replaced hardcoded python base"
+    HEALED=$((HEALED + 1))
+fi
+
+# 5.5.3 Dockerfile: verify the FROM/ARG chain resolves to node. If the tag's
+#       generator wrote a python default INTO the Dockerfile itself, heal it.
+if grep -q 'python:3.11-slim' "${STATE_DIR}/Dockerfile" 2>/dev/null; then
+    sed -i '' 's/python:3.11-slim/node:24-slim/g' "${STATE_DIR}/Dockerfile"
+    warn "Dockerfile healed: replaced hardcoded python base"
+    HEALED=$((HEALED + 1))
+fi
+
+# 5.5.4 mem_limit guard (exit 137 = OOM). Repair, then verify — no soft pass.
+if [[ -f "$COMPOSE_FILE" ]] && grep -q 'mem_limit:' "$COMPOSE_FILE"; then
+    CUR_MEM="$(grep -m1 'mem_limit:' "$COMPOSE_FILE" | awk '{print $2}')"
+    if [[ "$CUR_MEM" != "$MEM_LIMIT_DESIRED" ]]; then
+        sed -i '' "s/mem_limit:.*/mem_limit: ${MEM_LIMIT_DESIRED}/" "$COMPOSE_FILE"
+        warn "mem_limit healed: ${CUR_MEM} -> ${MEM_LIMIT_DESIRED}"
+        HEALED=$((HEALED + 1))
+    else
+        ok "mem_limit already ${MEM_LIMIT_DESIRED}"
+    fi
+fi
+
+if [[ "$HEALED" -gt 0 ]]; then
+    ok "Self-heal complete: ${HEALED} repair(s) applied — generated files now override tag defaults"
+else
+    ok "No healing needed — generated files already correct"
+fi
+
+###############################################################################
+# PHASE 6 — EIGHT-POINT INSPECTION (fail-fast BEFORE the expensive build)
+###############################################################################
+
+step "Eight-point inspection of (healed) generated files"
 
 fail_count=0
 inspect() {
@@ -351,93 +463,82 @@ inspect() {
 inspect "1. Dockerfile has getent group guard" \
     grep -q 'getent group' "${STATE_DIR}/Dockerfile"
 
-# 2. Node base image (not python)
-inspect "2. Dockerfile uses node base image" \
-    grep -q 'node:24-slim' "${STATE_DIR}/Dockerfile"
+# 2. Node base in the Dockerfile (hard value or ARG default)
+if grep -qE '(FROM node:24-slim)|(ARG BASE_IMAGE=node:24-slim)' "${STATE_DIR}/Dockerfile"; then
+    ok "2. Dockerfile resolves to node base image"
+else
+    warn "2. Dockerfile base is NOT node:24-slim — CHECK FAILED"
+    fail_count=$((fail_count + 1))
+fi
 
-# 3. gateway.mode in config (schema requirement)
-inspect "3. openclaw.json has gateway.mode" \
+# 3. No python ANYWHERE in the build chain (Dockerfile, docker.env, compose)
+PY_GHOST=0
+for f in Dockerfile docker.env docker-compose.yml; do
+    if [[ -f "${STATE_DIR}/${f}" ]] && grep -q 'python:3.11-slim' "${STATE_DIR}/${f}"; then
+        warn "3. python base image found in ${f} — CHECK FAILED"
+        PY_GHOST=$((PY_GHOST + 1))
+    fi
+done
+if [[ "$PY_GHOST" -eq 0 ]]; then
+    ok "3. No python base ghost in Dockerfile/docker.env/compose"
+else
+    fail_count=$((fail_count + 1))
+fi
+
+# 4. docker.env positively carries the forced node base (was a soft bonus in v1.1)
+inspect "4. docker.env carries BASE_IMAGE=${FORCED_BASE_IMAGE}" \
+    grep -q "^BASE_IMAGE=${FORCED_BASE_IMAGE}\$" "$DOCKER_ENV_FILE"
+
+# 5. gateway.mode in config (schema requirement)
+inspect "5. openclaw.json has gateway.mode" \
     grep -q 'gateway: { mode: "local" }' "${STATE_DIR}/openclaw.json"
 
-# 4. Correct entrypoint
-inspect "4. Dockerfile CMD is openclaw gateway" \
+# 6. Correct entrypoint
+inspect "6. Dockerfile CMD is openclaw gateway" \
     grep -q 'CMD \["openclaw", "gateway"\]' "${STATE_DIR}/Dockerfile"
 
-# 5. Roster: every .env roster member must appear in config
+# 7. Roster: every .env roster member present; NO default-roster contamination
 ROSTER_CHECK="$(grep -E '^AGENT_ROSTER=' "$ENV_FILE" | cut -d= -f2)"
-ok "5. Roster from .env: ${ROSTER_CHECK}"
+ok "7. Roster from .env: ${ROSTER_CHECK}"
 IFS=',' read -ra CHECK_NAMES <<< "$ROSTER_CHECK"
 for name in "${CHECK_NAMES[@]}"; do
     inspect "   - agent '${name}' present in openclaw.json" \
         grep -q "${name}" "${STATE_DIR}/openclaw.json"
 done
-
-# 6. NO default-roster contamination (the clawdia-DB admission errors)
 if grep -Eq "${DEFAULT_ROSTER_RE}" "${STATE_DIR}/openclaw.json"; then
-    warn "6. DEFAULT-ROSTER NAMES FOUND in openclaw.json — AGENT_ROSTER not applied!"
-    warn "   Delete the container's stale DBs: they alias-check against the wrong paths."
+    warn "   DEFAULT-ROSTER NAMES in openclaw.json — AGENT_ROSTER not applied!"
     fail_count=$((fail_count + 1))
 else
-    ok "6. No default-roster contamination in config"
+    ok "   No default-roster contamination in config"
 fi
 
-# 7. agents/ dir contains ONLY roster members (no orphan DBs to trip the
-#    admission alias check or the stale-lease integrity gate)
+# 8. agents/ dir contains ONLY roster members (no orphan DBs)
 if [[ -d "${STATE_DIR}/agents" ]]; then
     orphan_found=false
     for d in "${STATE_DIR}/agents"/*/; do
         [[ -d "$d" ]] || continue
         n="$(basename "$d")"
         if ! echo ",${ROSTER_CHECK}," | grep -q ",${n},"; then
-            warn "7. agents/ contains non-roster entry: ${n} (orphan DB)"
+            warn "8. agents/ contains non-roster entry: ${n} (orphan DB)"
             orphan_found=true
         fi
     done
     if [[ "$orphan_found" == "true" ]]; then
         fail_count=$((fail_count + 1))
     else
-        ok "7. agents/ contains only roster members"
+        ok "8. agents/ contains only roster members"
     fi
 else
-    ok "7. No agents/ dir yet (DBs created at first boot — clean slate)"
-fi
-
-# Bonus: docker.env must carry the node base
-if [[ -f "${STATE_DIR}/docker.env" ]]; then
-    if grep -Eq '(BASE_IMAGE=node)|(^$)' "${STATE_DIR}/docker.env" >/dev/null 2>&1; then
-        ok "Bonus: docker.env not carrying a python BASE_IMAGE"
-    fi
-    if grep -q 'BASE_IMAGE=python' "${STATE_DIR}/docker.env" 2>/dev/null; then
-        warn "Bonus: docker.env has python BASE_IMAGE — FIXING"
-        sed -i '' '/BASE_IMAGE=python/d' "${STATE_DIR}/docker.env"
-    fi
+    ok "8. No agents/ dir yet (DBs created at first boot — clean slate)"
 fi
 
 if [[ "$fail_count" -gt 0 ]]; then
     die "${fail_count} inspection check(s) failed — NOT building.
-    Fix the generator or .env, then re-run. No build time wasted."
+    Even after self-heal, something is wrong upstream (generator or tag).
+    Fix, then re-run. No build time wasted."
 fi
 
 ok "All inspection checks passed"
-
-###############################################################################
-# PHASE 6.5 — MEMORY LIMIT GUARD (exit 137 = OOM prevention)
-###############################################################################
-
-step "Memory limit guard (target: ${MEM_LIMIT_DESIRED})"
-
-COMPOSE_FILE="${STATE_DIR}/docker-compose.yml"
-if [[ -f "$COMPOSE_FILE" ]] && grep -q 'mem_limit:' "$COMPOSE_FILE"; then
-    CUR_MEM="$(grep -m1 'mem_limit:' "$COMPOSE_FILE" | awk '{print $2}')"
-    if [[ "$CUR_MEM" != "$MEM_LIMIT_DESIRED" ]]; then
-        sed -i '' "s/mem_limit:.*/mem_limit: ${MEM_LIMIT_DESIRED}/" "$COMPOSE_FILE"
-        ok "Bumped mem_limit ${CUR_MEM} -> ${MEM_LIMIT_DESIRED} (exit 137 = OOM kill — this was the crash loop)"
-    else
-        ok "mem_limit already ${MEM_LIMIT_DESIRED}"
-    fi
-else
-    ok "No mem_limit directive in compose (uncapped) or file absent"
-fi
 
 ###############################################################################
 # PHASE 7 — BUILD
@@ -485,8 +586,8 @@ docker logs openclaw-triad --tail 60 2>&1 || true
 
 # Detect container-state mount path for the doctor hint
 CSTATE="$DEFAULT_CONTAINER_STATE_DIR"
-if [[ -f "${STATE_DIR}/docker.env" ]]; then
-    DETECTED="$(grep -E '^CONTAINER_STATE_DIR=' "${STATE_DIR}/docker.env" | cut -d= -f2)"
+if [[ -f "$DOCKER_ENV_FILE" ]]; then
+    DETECTED="$(grep -E '^CONTAINER_STATE_DIR=' "$DOCKER_ENV_FILE" | cut -d= -f2)"
     [[ -n "$DETECTED" ]] && CSTATE="$DETECTED"
 fi
 
@@ -498,7 +599,8 @@ cat << EOF
   State dir:   ${STATE_DIR}
   Recipe tag:  ${PINNED_TAG}
   Backup:      ${BACKUP_FILE:-none}
-  Mem limit:   ${MEM_LIMIT_DESIRED}
+  Base image:  ${FORCED_BASE_IMAGE} (forced)
+  Mem limit:   ${MEM_LIMIT_DESIRED} (enforced)
   Fresh VM:    ${FRESH_VM}
 
   Watch it live:      make logs
