@@ -1,49 +1,37 @@
 #!/usr/bin/env bash
 #
-# setup-openclaw-triad.sh (v3.1)
+# setup-openclaw-triad.sh (v3.2)
 #
-# FULL REWRITE consolidating every hard-won fix from the deployment saga.
-# Replaces the v2.5 generator (and the corrupted post-v2.5 sed patches).
+# Consolidates every fix from the 2026-11-07 deployment saga.
+#
+# CHANGELOG v3.2 (vs v3.1) — "schema-valid + writable temp"
+#   CONFIG (openclaw.json) — validated against the live runtime schema:
+#     - REMOVED theme:/role: from agent entries (Unrecognized keys);
+#       personas live in agents' AGENTS.md / DREAMS.md, their true home.
+#     - ADDED agents.ownership: "explicit" (multi-agent roster requirement).
+#     - REMOVED agents.bindings (Unrecognized key) — Telegram channel
+#       registration happens at runtime via `openclaw channels add telegram`
+#       (the runtime suppressed ambient env credentials and told us the
+#       correct mechanism on 2026-11-07).
+#     - REMOVED root-level swarm key (Unrecognized key).
+#     - Display name is the roster name VERBATIM ("thesource" stays
+#       "thesource"; naive capitalization produced "Thesource").
+#   COMPOSE:
+#     - Second tmpfs /home/openclaw/.tmp (uid/gid matched, 0700) plus
+#       TMPDIR/TMP env pointing at it. Root fs is read_only; the runtime's
+#       secure-temp requirements demand a REAL private dir — /tmp is not
+#       writable and fails with "Unable to create fallback OpenClaw temp dir".
+#   GENERAL:
+#     - Post-generation summary reminds about `openclaw channels add telegram`
+#       when TELEGRAM_BOT_TOKEN is present.
 #
 # CHANGELOG v3.1 (vs v3.0)
-#   - Accept --non-interactive (legacy v2.5 Makefile compat). v3 is ALWAYS
-#     non-interactive (reads env/.env) — flag is now an accepted no-op.
-#   - Accept --yes for Makefile friends that pass it (same no-op).
-#
-# CHANGELOG v3.0 (vs v2.5)
-#   DOCKERFILE:
-#     - Standalone, well-formed `RUN rm -rf "${CONTAINER_STATE_DIR}/openclaw.json"`
-#       guard AFTER the user-creation chain (fixes the "unknown instruction &&"
-#       parse error caused by a sed-append into a line-continuation chain, and
-#       guarantees no config-shaped directory can ever exist in the image).
-#   COMPOSE:
-#     - Dropped the redundant per-file `openclaw.json:ro` mount (the parent
-#       state-dir bind already delivers it; file-over-dir mount caused
-#       "not a directory" OCI failures). Config protection now rests on the
-#       container's own read-only posture.
-#     - mem_limit default raised to 3g (rss measured at 1.6 GiB under the old
-#       2g cap with 16 workers -> memory-pressure warnings + historic exit 137).
-#   CONFIG (openclaw.json):
-#     - sandbox mode "off" everywhere (a containerized Gateway cannot resolve
-#       sandbox bind sources; the container IS the sandbox).
-#     - models.providers.nanogpt block emitted when NANOGPT_API_KEY is set:
-#       baseUrl https://nano-gpt.com/api/v1 (suffix required), OpenAI-compat
-#       adapter, key interpolated from env at runtime (literal ${NANOGPT_API_KEY}).
-#     - Catalog ids inside the provider list are BARE (NanoGPT's API expects
-#       e.g. "anthropic/claude-sonnet-4-6"); model REFERENCES elsewhere are
-#       nanogpt/-prefixed (openclaw's router expects provider-prefixed refs).
-#       Two audiences, two spellings — the double-prefix bug is impossible now.
-#     - systemAgent: { agentId: <first roster member> } in agents.defaults so
-#       the TUI/unscoped CLI lands on YOUR agent, not the clawdia default slot.
-#     - Telegram binding accountId derives from ${JUDGE} (was hardcoded "arbiter").
-#     - All runtime paths in config use CONTAINER paths (agents.defaults
-#       workspace/cwd + per-agent workspace/agentDir). Host paths appear only
-#       in compose/docker.env where the host is the audience.
-#   ENV:
-#     - BASE_IMAGE default node:24-slim (the python ghost is dead at the source).
-#   GENERAL:
-#     - Preserves and NEVER regenerates an existing .env (seeds one if absent).
-#     - Bash 3.2 safe (macOS stock): no ${var,,}, no associative arrays.
+#     - --non-interactive/--yes accepted as no-ops (v2.5 Makefile compat).
+#     - Standalone RUN rm -rf guard in Dockerfile; dropped openclaw.json:ro
+#       mount (bind-type mismatch); mem_limit 3g (exit 137 under 2g); sandbox
+#       off (container IS the sandbox); nanogpt wiring (bare catalog ids,
+#       nanogpt/-prefixed refs); systemAgent; container paths throughout;
+#       BASE_IMAGE node:24-slim; .env stewardship; bash 3.2 safe.
 #
 set -euo pipefail
 
@@ -53,19 +41,20 @@ set -euo pipefail
 
 usage() {
     cat << 'USAGEEOF'
-setup-openclaw-triad.sh (v3.1) — generate the full OpenClaw triad stack.
+setup-openclaw-triad.sh (v3.2) — generate the full OpenClaw triad stack.
 
 Generates into OPENCLAW_STATE_DIR (default ~/.openclaw):
-  openclaw.json        Gateway config (JSON5, container paths, nanogpt wiring)
+  openclaw.json        Gateway config (schema-valid, container paths)
   agents/*/           Agent dirs (DBs created by runtime)
   workspace-triad/     Per-agent workspaces, journals, dreams, calibration
   shared/              Append-only ledgers + calibration CSVs
-  plugins/telegram-bot/bot.py   Roster-aware Telegram front-end
+  plugins/telegram-bot/bot.py   Legacy Telegram front-end (fallback only)
   tmp/ state/ logs/    Runtime dirs (lock files, leases, rotated logs)
   .gitignore           Keeps secrets + runtime state out of any repo
   Docker:
     Dockerfile         node:24-slim + openclaw runtime + image-side guard
-    docker-compose.yml whole-state-dir bind, 3g mem, locked-down runtime
+    docker-compose.yml whole-state-dir bind, 2x tmpfs (.cache + .tmp),
+                       TMPDIR wired, locked-down runtime
     docker.env         Interpolation vars (NO secrets — committable)
 
 Env-driven configuration (read from the environment; Makefile sources .env):
@@ -74,11 +63,11 @@ Env-driven configuration (read from the environment; Makefile sources .env):
                             3 = judge/read-only ruler)
   PERSONALITY_PRESET       default|mystic|bold|conservative|quant
   NANOGPT_API_KEY          enables nanogpt model provider wiring
-  OPENCLAW_GATEWAY_TOKEN    required for network-bound gateway auth
-  TELEGRAM_BOT_TOKEN       enables telegram channel + plugin
-  TELEGRAM_USER_ID          comma-separated allowlist for the bot
+  OPENCLAW_GATEWAY_TOKEN   required for network-bound gateway auth
+  TELEGRAM_BOT_TOKEN       enables telegram channel wiring
+  TELEGRAM_USER_ID         comma-separated allowlist for the bot
   ELEVENLABS_API_KEY       enables per-agent TTS voices
-  AGENT_<NAME>_MODEL/THEME/ROLE/THINKING   per-agent overrides
+  AGENT_<NAME>_MODEL/THINKING/VOICE   per-agent overrides
   BASE_IMAGE               default node:24-slim
   OPENCLAW_VERSION         npm version of openclaw runtime (default latest)
   DOCKER_ENABLE=true       emit Docker files (or pass --docker)
@@ -87,10 +76,12 @@ Flags:
   --state-dir PATH   override OPENCLAW_STATE_DIR
   --docker           force-enable Docker emission
   --wallet TYPE      btc|xmr|eth custodial config (position-2 agent holds it)
-  --non-interactive  accepted for v2.5 Makefile compat — v3 is always
-                     non-interactive (everything is driven by env/.env)
+  --non-interactive  v2.5 compat no-op (v3+ is always env/.env driven)
   --yes              alias of --non-interactive (no-op)
   --help             this message
+
+NOTE: the Telegram CHANNEL is registered at runtime, post-boot:
+    docker exec -it openclaw-triad openclaw channels add telegram
 USAGEEOF
     exit 0
 }
@@ -111,7 +102,6 @@ while [[ $# -gt 0 ]]; do
         --wallet)
             [[ -n "${2:-}" ]] || { echo "--wallet needs a type (btc|xmr|eth)" >&2; exit 1; }
             WALLET_TYPE_ARG="$2"; shift 2 ;;
-        # v2.5-compat no-ops: v3 is always non-interactive (env/.env driven).
         --non-interactive|--yes) shift ;;
         --help|-h)  usage ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 1 ;;
@@ -181,7 +171,6 @@ USE_WALLET=false; [[ -n "$WALLET_TYPE" ]] && USE_WALLET=true
 
 up() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
 
-# agent_var <name> <SUFFIX> <default>  ->  value of AGENT_<UPPERNAME>_<SUFFIX>
 agent_var() {
     local vname="AGENT_$(up "$1")_$2"
     local val="${!vname:-}"
@@ -191,7 +180,7 @@ agent_var() {
 mkdirs() { local d; for d in "$@"; do mkdir -p "$d"; done }
 
 ###############################################################################
-# PERSONAS + PRESETS
+# PERSONAS + PRESETS  (used for the agents' DOCS, not the config schema)
 ###############################################################################
 
 case "$PRESET" in
@@ -237,7 +226,7 @@ pref() {  # nanogpt-era reference spelling for a model id
     if [[ "$NANOGPT_ERA" == "true" ]]; then echo "nanogpt/$1"; else echo "$1"; fi
 }
 
-echo "== setup-openclaw-triad v3.1 =="
+echo "== setup-openclaw-triad v3.2 =="
 echo "   roster : ${SCOUT} (scout) / ${RISK} (risk) / ${JUDGE} (judge)"
 echo "   preset : ${PRESET}   base: ${BASE_IMAGE}   openclaw: ${OPENCLAW_VERSION}"
 echo "   era    : nanogpt=${NANOGPT_ERA} telegram=${TELEGRAM_ON} tts=${ELEVEN_ON} docker=${DOCKER_ENABLE}"
@@ -288,6 +277,8 @@ done
 
 ###############################################################################
 # PER-AGENT WORKSPACE DOCS (AGENTS.md + DREAMS.md)
+# Personas ACTUALLY live here — the runtime schema rejected theme/role on
+# agent entries, and the docs are what the agents read anyway.
 ###############################################################################
 
 timeline_docs() {
@@ -379,11 +370,18 @@ EOW
 fi
 
 ###############################################################################
-# OPENCLAW.JSON — assemble agent entries, then emit config
+# OPENCLAW.JSON — schema-valid (validated against live runtime 2026-11-07)
+#
+# Schema rules learned the hard way:
+#   - agent entries accept: name, workspace, agentDir, model, utilityModel,
+#     thinkingDefault, reasoningDefault, sandbox, tools, tts. NOT theme/role.
+#   - agents accepts: ownership ("explicit" required for multi-agent),
+#     defaults, entries. NOT bindings.
+#   - root accepts: gateway, models, agents. NOT swarm.
+#   - Telegram channel registration happens at runtime:
+#       openclaw channels add telegram
 ###############################################################################
 
-# nanogpt provider block (only in the nanogpt era). NOTE: apiKey stays the
-# LITERAL text ${NANOGPT_API_KEY} — openclaw interpolates env at runtime.
 MODELS_BLOCK=""
 if [[ "$NANOGPT_ERA" == "true" ]]; then
     MODELS_BLOCK=$(cat << 'EOMB'
@@ -406,24 +404,16 @@ EOMB
 )
 fi
 
-# Build agent entries + bindings in a bash variable (expanded now),
-# then splice into the quoted config heredoc below.
 AGENT_ENTRIES=""
-BINDINGS="[]"
-if [[ "$TELEGRAM_ON" == "true" ]]; then
-    BINDINGS="[ { agentId: \"${JUDGE}\", match: { channel: \"telegram\", accountId: \"${JUDGE}\" } } ]"
-fi
-
 for AGENT in "${ROSTER[@]}"; do
     case "$AGENT" in
-        "$SCOUT") THEME="$SCOUT_THEME"; ROLE="$SCOUT_ROLE"; DEF_MODEL="$SCOUT_MODEL_DEFAULT" ;;
-        "$RISK")  THEME="$RISK_THEME";  ROLE="$RISK_ROLE";  DEF_MODEL="$RISK_MODEL_DEFAULT"  ;;
-        *)        THEME="$JUDGE_THEME"; ROLE="$JUDGE_ROLE"; DEF_MODEL="$JUDGE_MODEL_DEFAULT" ;;
+        "$SCOUT") DEF_MODEL="$SCOUT_MODEL_DEFAULT" ;;
+        "$RISK")  DEF_MODEL="$RISK_MODEL_DEFAULT"  ;;
+        *)        DEF_MODEL="$JUDGE_MODEL_DEFAULT" ;;
     esac
     MODEL="$(agent_var "$AGENT" MODEL "$DEF_MODEL")"
     THINK="$(agent_var "$AGENT" THINKING medium)"
     VOICE="$(agent_var "$AGENT" VOICE "${ELEVENLABS_VOICE_ID:-default}")"
-    DISPLAY="$(up "${AGENT:0:1}")${AGENT:1}"
 
     TTS=""
     if [[ "$ELEVEN_ON" == "true" ]]; then
@@ -439,9 +429,7 @@ for AGENT in "${ROSTER[@]}"; do
     fi
 
     AGENT_ENTRIES="${AGENT_ENTRIES}      ${AGENT}: {
-        name: \"${DISPLAY}\",
-        theme: \"${THEME}\",
-        role: \"${ROLE}\",
+        name: \"${AGENT}\",
         workspace: \"${CONTAINER_WORKSPACE_ROOT}/${AGENT}\",
         agentDir: \"${CONTAINER_AGENTS_ROOT}/${AGENT}/agent\",
         model: {
@@ -456,13 +444,13 @@ for AGENT in "${ROSTER[@]}"; do
 done
 AGENT_ENTRIES="${AGENT_ENTRIES%,}"   # trim trailing comma (bash 3.2 param expansion)
 
-# Emit config. Splice pre-expanded variables; mode/settings stay JSON5-ish.
 cat << EOJSON > "${STATE_DIR}/openclaw.json"
-// Generated by setup-openclaw-triad.sh (v3.1)
+// Generated by setup-openclaw-triad.sh (v3.2)
 {
   gateway: { mode: "local" },
 ${MODELS_BLOCK}
   agents: {
+    ownership: "explicit",
     defaults: {
       systemAgent: { agentId: "${SCOUT}" },
       workspace: "${CONTAINER_WORKSPACE_ROOT}",
@@ -476,17 +464,16 @@ ${MODELS_BLOCK}
     },
     entries: {
 ${AGENT_ENTRIES}
-    },
-    bindings: ${BINDINGS}
-  },
-  swarm: false
+    }
+  }
 }
 EOJSON
 
-echo "   [ok] openclaw.json written (container paths, sandbox off, systemAgent=${SCOUT})"
+echo "   [ok] openclaw.json written (schema-valid: ownership explicit, no theme/role/bindings/swarm, systemAgent=${SCOUT})"
 
 ###############################################################################
-# TELEGRAM PLUGIN (roster-aware front-end)
+# TELEGRAM PLUGIN (legacy fallback front-end; primary path is the runtime
+# channel registered via `openclaw channels add telegram`)
 ###############################################################################
 
 TG_DIR="${PLUGINS_DIR}/telegram-bot"
@@ -494,7 +481,9 @@ mkdirs "$TG_DIR"
 
 cat << 'EOBOT' > "${TG_DIR}/bot.py"
 #!/usr/bin/env python3
-"""Roster-aware Telegram front-end for the OpenClaw triad."""
+"""Legacy roster-aware Telegram front-end for the OpenClaw triad.
+Primary path is the runtime channel (openclaw channels add telegram);
+keep this as a fallback if the channel route is unavailable."""
 import logging, os, asyncio
 
 logging.basicConfig(
@@ -553,7 +542,7 @@ EOBOT
 chmod +x "${TG_DIR}/bot.py"
 
 printf 'python-telegram-bot>=21,<22\n' > "${STATE_DIR}/requirements.txt"
-echo "   [ok] telegram plugin written (roster: ${ROSTER_RAW})"
+echo "   [ok] telegram plugin written (roster: ${ROSTER_RAW}; primary path: runtime channel)"
 
 ###############################################################################
 # GITIGNORE (state dir hygiene)
@@ -580,7 +569,7 @@ if [[ "$DOCKER_ENABLE" == "true" ]]; then
 
     # --- docker.env (interpolation vars; NO secrets — committable) ----------
     cat << EODE > "${STATE_DIR}/docker.env"
-# Generated by setup-openclaw-triad.sh (v3.1) — interpolation only, no secrets.
+# Generated by setup-openclaw-triad.sh (v3.2) — interpolation only, no secrets.
 COMPOSE_PROJECT_NAME=openclaw-triad
 
 # ---- Host paths (derived from OPENCLAW_STATE_DIR) ----
@@ -607,7 +596,7 @@ EODE
     # All ${VARS} below are Docker build args / env resolved by docker itself.
     cat << 'EODF' > "${STATE_DIR}/Dockerfile"
 # syntax=docker/dockerfile:1
-# Generated by setup-openclaw-triad.sh (v3.1)
+# Generated by setup-openclaw-triad.sh (v3.2)
 
 ARG BASE_IMAGE=node:24-slim
 
@@ -662,7 +651,7 @@ EODF
     # --- docker-compose.yml ----------------------------------------------------
     # ${VARS} below are interpolated by docker compose from docker.env.
     cat << 'EOCC' > "${STATE_DIR}/docker-compose.yml"
-# Generated by setup-openclaw-triad.sh (v3.1)
+# Generated by setup-openclaw-triad.sh (v3.2)
 services:
   openclaw-triad:
     image: openclaw-triad:local
@@ -681,6 +670,10 @@ services:
       OPENCLAW_STATE_DIR: ${CONTAINER_STATE_DIR}
       OPENCLAW_WORKSPACE_DIR: ${CONTAINER_STATE_DIR}/workspace-triad
       OPENCLAW_CONFIG_PATH: ${CONTAINER_STATE_DIR}/openclaw.json
+      # read_only container: the runtime demands a REAL private temp dir
+      # (uid-owned, 0700, trusted ancestors). /tmp is not writable here.
+      TMPDIR: /home/openclaw/.tmp
+      TMP: /home/openclaw/.tmp
     volumes:
       # Whole state dir: runtime needs tmp/, sqlite state, lease locks.
       # (The former per-file openclaw.json:ro overlay is GONE by design —
@@ -689,6 +682,8 @@ services:
     tmpfs:
       # User-owned secure temp/cache (root-owned tmpfs tripped EACCES once).
       - /home/openclaw/.cache:uid=${APP_UID},gid=${APP_GID},mode=0700
+      # Private temp root (2026-11-07: /tmp fallback denied on read_only fs).
+      - /home/openclaw/.tmp:uid=${APP_UID},gid=${APP_GID},mode=0700
     read_only: true
     cap_drop:
       - ALL
@@ -709,7 +704,7 @@ services:
       start_period: 60s
 EOCC
 
-    echo "   [ok] Docker trio written: Dockerfile + docker-compose.yml + docker.env (mem_limit=${CONTAINER_MEM_LIMIT}, no json:ro mount, standalone image-side guard)"
+    echo "   [ok] Docker trio written: Dockerfile + docker-compose.yml + docker.env (mem_limit=${CONTAINER_MEM_LIMIT}, .tmp tmpfs + TMPDIR, no json:ro mount, standalone image-side guard)"
 else
     echo "   [--] Docker emission skipped (DOCKER_ENABLE != true / no --docker)"
 fi
@@ -734,8 +729,12 @@ else
     echo "  1. Review ${ENV_FILE} (secrets, keys)"
     echo "  2. run with --docker / DOCKER_ENABLE=true for the container stack"
 fi
+echo "  3. make logs — expect [gateway] ready and your roster names registering"
+if [[ "$TELEGRAM_ON" == "true" ]]; then
+    echo "  4. Telegram channel (once, after first successful boot):"
+    echo "     make telegram    # or: docker exec -it openclaw-triad openclaw channels add telegram"
+fi
 cat << EOSUM2
-  3. make logs — expect [gateway] ready and your roster names registering
 
   First contact:
     docker exec -it openclaw-triad openclaw agent \\

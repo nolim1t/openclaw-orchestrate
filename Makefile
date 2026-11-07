@@ -192,8 +192,7 @@ status:
 	@echo "📁 State directory: $(OPENCLAW_STATE_DIR)"
 	@test -f "$(OPENCLAW_STATE_DIR)/openclaw.json" && \
 		echo "   Config: present" || echo "   Config: MISSING"
-	@test -f "$(ENV_FILE)" && \
-		echo "   Secrets: present ($(ENV_FILE))" || \
+	@test -f "$(ENV_FILE) && echo "   Secrets: present ($(ENV_FILE))" || \
 		echo "   Secrets: MISSING (try 'make secrets-restore')"
 	@test -f "$(SECRETS_STASH)" && \
 		echo "   Stash:   present ($(SECRETS_STASH))" || \

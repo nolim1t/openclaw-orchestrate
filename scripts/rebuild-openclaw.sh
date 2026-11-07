@@ -1,36 +1,26 @@
 #!/usr/bin/env bash
 #
-# rebuild-openclaw.sh (v1.3)
+# rebuild-openclaw.sh (v1.4)
 # One-command, from-scratch rebuild of the OpenClaw triad stack.
 #
-# CHANGELOG v1.3 — "nanogpt era" hardening
-#   - mem_limit default raised 2g -> 3g (rss hit 1.6GiB under 2g cap with
-#     16 workers; 3g gives headroom inside the 6GB colima VM).
-#   - NEW SELF-HEALS on the generated openclaw.json (no longer trusting
-#     the tag's generator for model wiring at all):
-#       * Injects the full models.providers.nanogpt block (OpenAI-compat
-#         router, /api/v1, env-interpolated key) when NANOGPT_API_KEY is
-#         set and the block is absent.
-#       * Strips double-prefixed catalog ids ("id: nanogpt/..." -> bare);
-#         NanoGPT's API expects bare ids like anthropic/claude-sonnet-4-6.
-#       * Prefixes model REFERENCES (primary/utilityModel/fallbacks) with
-#         nanogpt/ when bare — openclaw's router expects provider-prefixed
-#         refs. Idempotent: skips lines already prefixed.
-#       * Forces sandbox mode "all" -> "off" (sandbox-in-container cannot
-#         resolve bind sources; the container itself is the sandbox).
-#       * Injects agents.defaults.systemAgent.agentId = <first roster
-#         member> so the TUI lands on YOUR agent, not the clawdia slot.
-#   - Inspection expanded 8 -> 12 points, incl. provider presence,
-#     catalog-id hygiene, ref-prefix hygiene, sandbox-off, mem_limit.
+# CHANGELOG v1.4 — "lights-out" hardening
+#   - NEW heal: strips any 'openclaw.json:ro' mount from the generated
+#     docker-compose.yml (bind-type mismatch boot failure), and asserts
+#     openclaw.json is a REGULAR FILE before build (catches the
+#     config-shaped-directory ghost at the host side too).
+#   - Version-marker detection now matches v3.x generators (was v2-only).
+#   - Inspection expanded 12 -> 14 points (compose mount hygiene +
+#     openclaw.json regular-file assertion).
 #
-# CHANGELOG v1.2
-#   - Perimeter defence: BASE_IMAGE forced to node:24-slim across .env /
-#     docker.env / compose / Dockerfile; python ghost self-healed.
-# CHANGELOG v1.1
-#   - Pinned-tag auto-fetch; mem_limit enforcement; roster contamination
-#     inspection; doctor recovery hint.
-# CHANGELOG v1.0
-#   - Initial: backup -> teardown -> regenerate -> inspect -> build -> boot.
+# CHANGELOG v1.3 — "nanogpt era" hardening
+#   - mem_limit default 2g -> 3g (rss 1.6GiB under 2g cap with 16 workers).
+#   - Self-heals generated openclaw.json: injects models.providers.nanogpt
+#     block (bare catalog ids, nanogpt/-prefixed refs), forces sandbox off,
+#     injects agents.defaults.systemAgent = <first roster member>.
+#   - Inspection expanded 8 -> 12 points.
+# CHANGELOG v1.2 — BASE_IMAGE forced to node:24-slim everywhere.
+# CHANGELOG v1.1 — pinned-tag fetch; mem_limit enforcement; roster checks.
+# CHANGELOG v1.0 — backup -> teardown -> regenerate -> inspect -> build -> boot.
 #
 # USAGE:
 #   ./rebuild-openclaw.sh              # standard rebuild (keeps colima VM)
@@ -39,7 +29,7 @@
 #   ./rebuild-openclaw.sh --yes        # skip the confirmation prompt
 #
 # FETCH BEHAVIOUR (env-tunable):
-#   OPENCLAW_PINNED_TAG=20261106-1428   # GitHub tag to pull recipe from
+#   OPENCLAW_PINNED_TAG=20261107-1201   # GitHub tag to pull recipe from
 #   OPENCLAW_FETCH_MODE=auto|always|never
 #
 set -euo pipefail
@@ -57,15 +47,12 @@ SETUP_SCRIPT="${SCRIPTS_DIR}/setup-openclaw-triad.sh"
 MAKEFILE_PATH="${ORCHESTRATE_DIR}/Makefile"
 
 # --- Pinned recipe fetching -------------------------------------------------
-PINNED_TAG="${OPENCLAW_PINNED_TAG:-20261106-1201}"
+PINNED_TAG="${OPENCLAW_PINNED_TAG:-20261107-1201}"
 FETCH_REPO_BASE="https://raw.githubusercontent.com/nolim1t/openclaw-orchestrate/refs/tags/${PINNED_TAG}"
 FETCH_MODE="${OPENCLAW_FETCH_MODE:-auto}"   # auto | always | never
 
 # --- Runtime guardrails ------------------------------------------------------
-# The ONLY correct base image. Enforced regardless of tag defaults.
 FORCED_BASE_IMAGE="node:24-slim"
-# 3g: rss was 1.6GiB under the old 2g cap with 16 workers (memory-pressure
-# warnings at 100.3% threshold ratio). 3g inside the 6GB VM is comfortable.
 MEM_LIMIT_DESIRED="${OPENCLAW_MEM_LIMIT:-3g}"
 DEFAULT_CONTAINER_STATE_DIR="/home/openclaw/.openclaw"
 
@@ -73,10 +60,7 @@ FRESH_VM=false
 DO_BUILD=true
 ASSUME_YES=false
 
-# Stale overrides from the pre-Node era that must NEVER survive a rebuild.
 STALE_PATTERNS='BASE_IMAGE=python'
-
-# Default-roster names — contamination from an unconfigured AGENT_ROSTER.
 DEFAULT_ROSTER_RE='clawdia|clawdio|arbiter'
 
 ###############################################################################
@@ -106,17 +90,9 @@ Options:
   --help        This message.
 
 Environment:
-  OPENCLAW_PINNED_TAG   GitHub tag for Makefile + generator (default 20261106-1428).
+  OPENCLAW_PINNED_TAG   GitHub tag for Makefile + generator (default 20261107-1201).
   OPENCLAW_FETCH_MODE   auto (default) | always | never
   OPENCLAW_MEM_LIMIT    Container mem_limit to enforce (default 3g).
-
-Defence policy (v1.3):
-  Beyond base-image forcing, the script now TAKES OVER model wiring:
-  it injects/heals the models.providers.nanogpt block, keeps catalog ids
-  bare, keeps model refs nanogpt/-prefixed, forces sandbox off, sets
-  systemAgent to your first roster member, and enforces mem_limit 3g —
-  regardless of what the pinned tag's generator emits. The inspection
-  (12 points) then verifies all of it BEFORE the expensive build.
 
 What gets DELETED (irrecoverably):
   - ~/.openclaw/ and running openclaw containers/images
@@ -188,15 +164,26 @@ enforce_base_image() {
     return 0
 }
 
-# inject_nanogpt_provider <openclaw.json>
-# Idempotent: skipped if a providers block already exists in the config.
+# heal_compose_config_mount <docker-compose.yml>
+# v1.4 belt-over-braces: the parent state-dir bind already delivers
+# openclaw.json; a file-over-dir :ro mount causes 'not a directory' OCI
+# failures. Strip any such line, idempotently. Returns count stripped.
+heal_compose_config_mount() {
+    local cmp="$1" stripped=0
+    if [[ -f "$cmp" ]] && grep -q 'openclaw.json:ro' "$cmp"; then
+        sed -i '' '/openclaw.json:ro/d' "$cmp"
+        stripped=1
+    fi
+    return "$stripped"
+}
+
+# inject_nanogpt_provider <openclaw.json> — idempotent.
 inject_nanogpt_provider() {
     local cfg="$1"
-    grep -q 'providers: {' "$cfg" && return 1   # already present
+    grep -q 'providers: {' "$cfg" && return 1
 
-    # NOTE: the apiKey line stays LITERAL ${NANOGPT_API_KEY} text —
-    # openclaw interpolates env vars into config at runtime. Quoted heredoc
-    # guarantees the shell does not expand it here.
+    # apiKey line stays LITERAL ${NANOGPT_API_KEY} — openclaw interpolates
+    # env at runtime. Quoted heredoc guarantees no shell expansion here.
     local block
     block=$(cat << 'BLKEOF'
 models: {
@@ -216,18 +203,12 @@ models: {
 },
 BLKEOF
 )
-    # Insert after line 1 (the header comment). JSON5 is order-free, so a
-    # top-level key can be prepended safely as long as a comma follows.
     { head -n 1 "$cfg"; printf '%s\n' "$block"; tail -n +2 "$cfg"; } > "${cfg}.new" \
         && mv "${cfg}.new" "$cfg"
     grep -q 'providers: {' "$cfg"
 }
 
-# heal_model_refs <openclaw.json>
-# 1) Strip double-prefixed catalog ids ("id: "nanogpt/..." -> bare).
-#    NanoGPT's API receives the bare id; provider refs carry the prefix.
-# 2) Prefix bare model REFERENCES (primary/utilityModel/fallbacks).
-#    Both transforms are naturally idempotent.
+# heal_model_refs <openclaw.json> — catalog ids bare, refs prefixed. Idempotent.
 heal_model_refs() {
     local cfg="$1" healed=0
 
@@ -240,11 +221,9 @@ heal_model_refs() {
     for pat in 'primary: "anthropic/' 'primary: "openai/' \
                'utilityModel: "anthropic/' 'utilityModel: "openai/' \
                'fallbacks: ["anthropic/' 'fallbacks: ["openai/'; do
-        # construct replacement: insert nanogpt/ after the opening quote
         if grep -qF "${pat}" "$cfg"; then
             local repl
             repl="$(printf '%s' "$pat" | sed 's|\(["[]\)|\1nanogpt/|')"
-            # shellcheck disable=SCSC2086
             sed -i '' "s|${pat}|${repl}|g" "$cfg"
             healed=$((healed + 1))
         fi
@@ -253,22 +232,17 @@ heal_model_refs() {
 }
 
 # heal_sandbox_off <openclaw.json>
-# Containerized Gateways cannot resolve sandbox bind sources (no docker
-# sock); the container's own lockdown IS the sandbox.
 heal_sandbox_off() {
     local cfg="$1"
     if grep -q 'sandbox: { mode: "all"' "$cfg"; then
         sed -i '' 's/sandbox: { mode: "all", scope: "agent", workspaceAccess: "none" }/sandbox: { mode: "off" }/' "$cfg"
-        # fallback for whitespace/format variants: only on sandbox lines
         sed -i '' '/sandbox/s/mode: "all"/mode: "off"/g' "$cfg"
         return 0
     fi
     return 1
 }
 
-# inject_system_agent <openclaw.json> <first-roster-name>
-# Makes the TUI / un-scoped CLI land on YOUR first agent, not the built-in
-# clawdia slot. Idempotent.
+# inject_system_agent <openclaw.json> <first-roster-name> — idempotent.
 inject_system_agent() {
     local cfg="$1" first="$2"
     grep -q 'systemAgent' "$cfg" && return 1
@@ -319,7 +293,7 @@ fetch_required "Makefile"                        "$MAKEFILE_PATH" "makefile" "Ma
 fetch_required "scripts/setup-openclaw-triad.sh" "$SETUP_SCRIPT"  "shell"   "Generator script"
 
 bash -n "$SETUP_SCRIPT" || die "Setup script fails syntax check — fetch produced garbage or local copy is broken."
-GEN_VERSION="$(grep -o 'v2\.[0-9]*' "$SETUP_SCRIPT" | head -1)"
+GEN_VERSION="$(grep -oE 'v[0-9]+\.[0-9]+' "$SETUP_SCRIPT" | head -1)"
 ok "Generator syntax OK (version marker: ${GEN_VERSION:-unknown})"
 
 if grep -q 'set -a && . ' "$MAKEFILE_PATH"; then
@@ -420,18 +394,13 @@ else
     warn "Empty .env created — fill in NANOGPT_API_KEY after generation"
 fi
 
-# 4a. Scrub ALL BASE_IMAGE lines (stale or not) …
 if grep -E '^BASE_IMAGE=' "$ENV_FILE" >/dev/null 2>&1; then
     sed -i '' '/^BASE_IMAGE=/d' "$ENV_FILE"
     ok "Scrubbed existing BASE_IMAGE lines from .env"
 fi
-
-# 4b. …then FORCE the correct value back in (never leave a vacuum for
-#     tag defaults to refill with python).
 enforce_base_image "$ENV_FILE"
 ok "BASE_IMAGE forced to ${FORCED_BASE_IMAGE} in .env"
 
-# 4c. Token / roster defaults, same philosophy: force, don't trust.
 if ! grep -E '^OPENCLAW_GATEWAY_TOKEN=..+' "$ENV_FILE" >/dev/null 2>&1; then
     echo "OPENCLAW_GATEWAY_TOKEN=$(openssl rand -hex 32)" >> "$ENV_FILE"
     ok "Generated fresh OPENCLAW_GATEWAY_TOKEN"
@@ -453,7 +422,6 @@ if ! grep -E '^PERSONALITY_PRESET=..+' "$ENV_FILE" >/dev/null 2>&1; then
     ok "PERSONALITY_PRESET defaulted to mystic"
 fi
 
-# Does the nanogpt era apply to this build?
 NANOGPT_ERA=false
 if grep -E '^NANOGPT_API_KEY=..+' "$ENV_FILE" >/dev/null 2>&1; then
     NANOGPT_ERA=true
@@ -479,9 +447,10 @@ step "Self-healing generated files against tag defaults"
 
 HEALED=0
 CFG_FILE="${STATE_DIR}/openclaw.json"
+COMPOSE_FILE="${STATE_DIR}/docker-compose.yml"
+DOCKER_ENV_FILE="${STATE_DIR}/docker.env"
 
 # 5.5.1 docker.env: the file compose ACTUALLY interpolates from.
-DOCKER_ENV_FILE="${STATE_DIR}/docker.env"
 if [[ -f "$DOCKER_ENV_FILE" ]]; then
     if grep -E '^BASE_IMAGE=' "$DOCKER_ENV_FILE" >/dev/null 2>&1; then
         CUR_BASE="$(grep -m1 '^BASE_IMAGE=' "$DOCKER_ENV_FILE" | cut -d= -f2)"
@@ -501,8 +470,31 @@ else
     warn "docker.env not found after generation — generator layout changed?"
 fi
 
+# 5.5.1b compose: strip the redundant/harmful per-file config mount (v1.4)
+if [[ -f "$COMPOSE_FILE" ]]; then
+    if heal_compose_config_mount "$COMPOSE_FILE"; then
+        warn "docker-compose.yml healed: removed openclaw.json:ro mount (parent bind delivers config)"
+        HEALED=$((HEALED + 1))
+    else
+        ok "compose has no redundant openclaw.json:ro mount"
+    fi
+else
+    warn "docker-compose.yml not found after generation — generator layout changed?"
+fi
+
+# 5.5.1c config regular-file assertion (v1.4): catches both the image-side
+# directory-ghost equivalent and any host-side weirdness before the build.
+if [[ -f "$CFG_FILE" && ! -d "$CFG_FILE" ]]; then
+    ok "openclaw.json is a regular file"
+elif [[ -d "$CFG_FILE" ]]; then
+    rm -rf "$CFG_FILE"
+    warn "openclaw.json was a DIRECTORY — removed; run 'make setup' manually to regenerate"
+    die "openclaw.json was config-shaped directory; regenerated state requires rerun"
+else
+    die "openclaw.json not found after generation — generator output layout changed"
+fi
+
 # 5.5.2 compose / Dockerfile python ghosts
-COMPOSE_FILE="${STATE_DIR}/docker-compose.yml"
 if [[ -f "$COMPOSE_FILE" ]] && grep -q 'python:3.11-slim' "$COMPOSE_FILE"; then
     sed -i '' 's/python:3.11-slim/node:24-slim/g' "$COMPOSE_FILE"
     warn "docker-compose.yml healed: replaced hardcoded python base"
@@ -534,8 +526,6 @@ if [[ -f "$CFG_FILE" ]]; then
     else
         ok "sandbox already off (or absent) in openclaw.json"
     fi
-else
-    die "openclaw.json not found after generation — generator output layout changed"
 fi
 
 # 5.5.5 nanogpt model wiring (only in the nanogpt era)
@@ -575,10 +565,10 @@ else
 fi
 
 ###############################################################################
-# PHASE 6 — TWELVE-POINT INSPECTION (fail-fast BEFORE the expensive build)
+# PHASE 6 — FOURTEEN-POINT INSPECTION (fail-fast BEFORE the expensive build)
 ###############################################################################
 
-step "Twelve-point inspection of (healed) generated files"
+step "Fourteen-point inspection of (healed) generated files"
 
 fail_count=0
 inspect() {
@@ -590,7 +580,6 @@ inspect() {
         fail_count=$((fail_count + 1))
     fi
 }
-# Like inspect(), but PASSES when the command finds nothing.
 inspect_absent() {
     local desc="$1"; shift
     if "$@" >/dev/null 2>&1; then
@@ -639,6 +628,14 @@ inspect "5. openclaw.json has gateway.mode" \
 inspect "6. Dockerfile CMD is openclaw gateway" \
     grep -q 'CMD \["openclaw", "gateway"\]' "${STATE_DIR}/Dockerfile"
 
+# 6b. Standalone image-side rm -rf guard in the Dockerfile (v1.4)
+inspect "6b. Dockerfile has image-side rm -rf openclaw.json guard" \
+    grep -q 'rm -rf "${CONTAINER_STATE_DIR}/openclaw.json"' "${STATE_DIR}/Dockerfile"
+
+# 6c. Compose must NOT contain the redundant per-file config mount (v1.4)
+inspect_absent "6c. compose has no openclaw.json:ro mount" \
+    grep -q 'openclaw.json:ro' "$COMPOSE_FILE"
+
 # 7. Roster members present; NO default-roster contamination
 ok "7. Roster from .env: ${ROSTER_CHECK}"
 IFS=',' read -ra CHECK_NAMES <<< "$ROSTER_CHECK"
@@ -675,15 +672,12 @@ fi
 
 # 9-11. Nanogpt-era checks (conditional)
 if [[ "$NANOGPT_ERA" == "true" ]]; then
-    # 9. provider block present with the required baseUrl suffix
     inspect "9. models.providers.nanogpt present (baseUrl /api/v1)" \
         grep -q 'baseUrl: "https://nano-gpt.com/api/v1"' "$CFG_FILE"
 
-    # 10. catalog ids must be BARE (no nanogpt/ prefix inside provider list)
     inspect_absent "10. catalog ids bare (no id: \"nanogpt/...) in provider list" \
         grep -q 'id: "nanogpt/' "$CFG_FILE"
 
-    # 11. references must be nanogpt/-prefixed
     if grep -q '"nanogpt/' "$CFG_FILE" \
        && ! grep -Eq '(primary|utilityModel): "(anthropic|openai)/' "$CFG_FILE" \
        && ! grep -q 'fallbacks: \["(anthropic|openai)/' "$CFG_FILE"; then
@@ -706,7 +700,6 @@ inspect "    mem_limit is ${MEM_LIMIT_DESIRED}" \
 if grep -q "systemAgent" "$CFG_FILE"; then
     ok "    systemAgent set (TUI lands on ${ROSTER_FIRST})"
 else
-    # Soft: schema variance across openclaw versions — warn, don't block
     warn "    systemAgent not set — TUI may land on the clawdia default slot"
 fi
 
