@@ -1,39 +1,39 @@
 #!/usr/bin/env bash
 #
-# Makefile for OpenClaw Triad Orchestration (v3 — secrets-stash aware)
+# Makefile for OpenClaw Triad Orchestration (v3.1 — secrets-stash + telegram)
 # Place this in ~/openclaw-orchestrate/Makefile
 #
-# KEY CHANGE vs v2: a persistent secrets stash OUTSIDE the state dir.
-#   env/.env.real-secrets  — your actual API keys, lives here forever.
-#   env/.env.example       — shape-only template (no real keys), safe to commit.
-# 'make init' now seeds in priority order: stash first, example second.
-# 'make secrets-save' snapshots the live .env into the stash.
-# 'make secrets-restore' pushes the stash back into the state dir.
+# v3.1 (vs v3): NEW `make telegram` target (runtime channel registration —
+#   the README/.env.example reference it as the canonical path); fixed the
+#   unclosed-quote syntax error in the status target's Secrets line that
+#   killed `make status` (and therefore `make docker-up`) after boot.
+# v3 (vs v2): secrets-stash lifecycle — env/.env.real-secrets persists your
+#   keys across state-dir wipes; init seeds from stash first, example second.
 #
-# IMPORTANT: the rebuild script overwrites this Makefile from the pinned
-# tag on every run — commit + tag any change here (Layer 3), or the
-# fetch silently reverts it.
+# IMPORTANT: the rebuild script fetches this Makefile from the pinned tag
+# on every run and overwrites the local copy — commit + tag any change here.
 #
 # USAGE:
-#   make init            # Create dirs, seed .env (stash > example)
-#   make secrets-save    # Snapshot live .env -> env/.env.real-secrets
-#   make secrets-restore # Push stash -> live .env (no questions asked)
-#   make setup           # Regenerate the stack using .env values
-#   make docker-build    # Build the container image
-#   make docker-up       # Start the Gateway
-#   make docker-down     # Stop containers (state preserved)
-#   make clean           # Remove containers + image (state preserved)
-#   make wipe            # DANGER: remove ALL state (typed confirmation)
-#   make logs            # Follow Gateway logs live
-#   make logs-system     # Last 100 log lines
-#   make shell           # Shell into the container
-#   make status          # Deployment + state directory health
-#   make agents          # Show the configured roster
-#   make help            # This reference
+#   make init             # Create dirs, seed .env (stash > example)
+#   make secrets-save     # Snapshot live .env -> env/.env.real-secrets
+#   make secrets-restore  # Push stash -> live .env
+#   make setup            # Regenerate the stack using .env values
+#   make docker-build     # Build the container image
+#   make docker-up        # Start the Gateway
+#   make docker-down      # Stop containers (state preserved)
+#   make telegram         # Register the Telegram channel (once, post-boot)
+#   make clean            # Remove containers + image (state preserved)
+#   make wipe             # DANGER: remove ALL state (typed confirmation)
+#   make logs             # Follow Gateway logs live
+#   make logs-system      # Last 100 log lines
+#   make shell            # Shell into the container
+#   make status           # Deployment + state directory health
+#   make agents           # Show the configured roster
+#   make help             # This reference
 #
 
 SHELL := /bin/bash
-.PHONY: init secrets-save secrets-restore setup docker-build docker-up docker-down clean wipe logs logs-system shell status agents help
+.PHONY: init secrets-save secrets-restore setup docker-build docker-up docker-down telegram clean wipe logs logs-system shell status agents help
 
 # =============================================================================
 # CONFIGURATION (override via environment or .env file)
@@ -51,6 +51,8 @@ ENV_FILE ?= $(OPENCLAW_STATE_DIR)/.env
 ENV_DIR ?= $(ORCHESTRATE_DIR)/env
 SECRETS_STASH ?= $(ENV_DIR)/.env.real-secrets
 SECRETS_EXAMPLE ?= $(ENV_DIR)/.env.example
+
+CONTAINER_NAME ?= openclaw-triad
 
 DOCKER_ENABLE ?= true
 
@@ -73,7 +75,7 @@ init:
 		cp $(SECRETS_STASH) $(ENV_FILE); \
 		chmod 600 $(ENV_FILE); \
 		echo "   ✓ Seeded $(ENV_FILE) from real-secrets STASH"; \
-		echo "   ⚠  Never a bad moment: 'make secrets-save' to refresh the stash"; \
+		echo "   ℹ  Never a bad moment: 'make secrets-save' to refresh the stash"; \
 	elif [ -f "$(SECRETS_EXAMPLE)" ]; then \
 		cp $(SECRETS_EXAMPLE) $(ENV_FILE); \
 		chmod 600 $(ENV_FILE); \
@@ -104,7 +106,8 @@ secrets-restore:
 	@echo "🔓 Restored stash -> $(ENV_FILE)"
 
 # =============================================================================
-# SETUP — sources .env so ALL variables (roster, preset, keys) reach the script
+# SETUP — sources .env so ALL variables (roster, preset, keys, models) reach
+# the generator. Env-driven lineup since generator v3.3.
 # =============================================================================
 
 setup:
@@ -145,6 +148,20 @@ docker-down:
 	@echo "✓ Containers stopped"
 
 # =============================================================================
+# TELEGRAM — channel registration happens AT RUNTIME, once, after the
+# gateway has booted successfully. Requires TELEGRAM_BOT_TOKEN + USER_ID
+# in .env, and the gateway up. This is not an idempotent generator step.
+# =============================================================================
+
+telegram:
+	@docker ps --format '{{.Names}}' | grep -q '^$(CONTAINER_NAME)$$' \
+		|| { echo "❌ $(CONTAINER_NAME) is not running — boot first (make docker-up)"; exit 1; }
+	@grep -qE '^TELEGRAM_BOT_TOKEN=..' $(ENV_FILE) 2>/dev/null \
+		|| { echo "❌ TELEGRAM_BOT_TOKEN missing/empty in $(ENV_FILE)"; exit 1; }
+	@echo "📡 Registering the Telegram channel (interactive)..."
+	@docker exec -it $(CONTAINER_NAME) openclaw channels add telegram
+
+# =============================================================================
 # CLEANUP
 # =============================================================================
 
@@ -177,12 +194,15 @@ logs-system:
 
 shell:
 	@test -f "$(COMPOSE_FILE)" || { echo "❌ No compose file found"; exit 1; }
-	cd $(OPENCLAW_STATE_DIR) && docker compose --env-file $(COMPOSE_ENV) exec openclaw-triad /bin/bash
+	cd $(OPENCLAW_STATE_DIR) && docker compose --env-file $(COMPOSE_ENV) exec $(CONTAINER_NAME) /bin/bash
 
 agents:
 	@echo "🤖 Configured roster (from $(ENV_FILE)):"
 	@grep -E '^AGENT_ROSTER' $(ENV_FILE) 2>/dev/null || echo "   AGENT_ROSTER not set — script default applies"
 	@grep -E '^PERSONALITY_PRESET' $(ENV_FILE) 2>/dev/null || true
+	@echo "🧠 Model lineup:"
+	@grep -E '^(NANOGPT_MODEL_CATALOG|TRIAD_[A-Z]+_MODEL|UTILITY_MODEL)=' $(ENV_FILE) 2>/dev/null \
+		|| echo "   (no overrides — builtin Claude/GPT defaults apply)"
 
 status:
 	@echo "📊 Deployment status:"
@@ -192,7 +212,8 @@ status:
 	@echo "📁 State directory: $(OPENCLAW_STATE_DIR)"
 	@test -f "$(OPENCLAW_STATE_DIR)/openclaw.json" && \
 		echo "   Config: present" || echo "   Config: MISSING"
-	@test -f "$(ENV_FILE) && echo "   Secrets: present ($(ENV_FILE))" || \
+	@test -f "$(ENV_FILE)" && \
+		echo "   Secrets: present ($(ENV_FILE))" || \
 		echo "   Secrets: MISSING (try 'make secrets-restore')"
 	@test -f "$(SECRETS_STASH)" && \
 		echo "   Stash:   present ($(SECRETS_STASH))" || \
@@ -212,28 +233,29 @@ help:
 	@echo "============================"
 	@echo ""
 	@echo "Commands:"
-	@echo "  make init            Initialize dirs, seed .env (stash > example)"
-	@echo "  make secrets-save    Snapshot live .env -> env/.env.real-secrets"
-	@echo "  make secrets-restore Restore stash -> live .env"
-	@echo "  make setup           Regenerate the stack using .env values"
-	@echo "  make docker-build    Build the container image"
-	@echo "  make docker-up        Start the gateway"
-	@echo "  make docker-down      Stop containers"
-	@echo "  make clean           Remove containers + image (state preserved)"
-	@echo "  make wipe            DANGER: remove ALL state (confirm required)"
-	@echo "  make logs            Follow gateway logs"
-	@echo "  make logs-system     Last 100 lines of logs"
-	@echo "  make shell           Shell into the container"
-	@echo "  make agents          Show configured roster and preset"
-	@echo "  make status          Deployment and state health (incl. stash)"
+	@echo "  make init             Initialize dirs, seed .env (stash > example)"
+	@echo "  make secrets-save     Snapshot live .env -> env/.env.real-secrets"
+	@echo "  make secrets-restore  Restore stash -> live .env"
+	@echo "  make setup            Regenerate the stack using .env values"
+	@echo "  make docker-build     Build the container image"
+	@echo "  make docker-up         Start the gateway"
+	@echo "  make docker-down       Stop containers"
+	@echo "  make telegram          Register Telegram channel (once, post-boot)"
+	@echo "  make clean             Remove containers + image (state preserved)"
+	@echo "  make wipe              DANGER: remove ALL state (confirm required)"
+	@echo "  make logs              Follow gateway logs"
+	@echo "  make logs-system       Last 100 lines of logs"
+	@echo "  make shell              Shell into the container"
+	@echo "  make agents            Show roster, preset, and model lineup"
+	@echo "  make status            Deployment and state health (incl. stash)"
 	@echo ""
-	@echo "From-scratch bootstrap:"
-	@echo "  1. make init                  # seeds .env from stash if present"
-	@echo "  2. make secrets-restore       # if .env keys look stale"
-	@echo "  3. Edit $(ENV_FILE):"
+	@echo "Workflow:"
+	@echo "  1. make init"
+	@echo "  2. Edit $(ENV_FILE):"
 	@echo "       NANOGPT_API_KEY, OPENCLAW_GATEWAY_TOKEN,"
-	@echo "       AGENT_ROSTER, PERSONALITY_PRESET"
-	@echo "  4. make secrets-save          # persist your keys for next wipe"
-	@echo "  5. make setup"
-	@echo "  6. make docker-build && make docker-up"
+	@echo "       AGENT_ROSTER, PERSONALITY_PRESET, model lineup"
+	@echo "  3. make secrets-save   # persist keys + lineup to the stash"
+	@echo "  4. make setup"
+	@echo "  5. make docker-build && make docker-up"
+	@echo "  6. make telegram        # once, after first successful boot"
 	@echo ""
