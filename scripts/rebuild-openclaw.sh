@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 #
-# rebuild-openclaw.sh (v1.4)
+# rebuild-openclaw.sh (v1.5)
 # One-command, from-scratch rebuild of the OpenClaw triad stack.
 #
-# CHANGELOG v1.4 — "lights-out" hardening
-#   - NEW heal: strips any 'openclaw.json:ro' mount from the generated
-#     docker-compose.yml (bind-type mismatch boot failure), and asserts
-#     openclaw.json is a REGULAR FILE before build (catches the
-#     config-shaped-directory ghost at the host side too).
-#   - Version-marker detection now matches v3.x generators (was v2-only).
-#   - Inspection expanded 12 -> 14 points (compose mount hygiene +
-#     openclaw.json regular-file assertion).
+# CHANGELOG v1.5 (vs v1.4) — "match generator v3.3"
+#   - NEW heals, matching what the v3.3 generator emits:
+#       * .tmp tmpfs + TMPDIR in compose (read_only fs requires a real
+#         private temp root; /tmp fallback denial killed boots once).
+#       * agents.ownership "explicit" in config (schema requirement for
+#         multi-agent rosters).
+#       * Schema-ghost strip: theme:/role:/bindings/swarm lines removed
+#         (v3.1-and-older generators emitted them; the runtime rejects).
+#   - Inspection grown 14 -> 17 points: tmpfs/TMPDIR, ownership,
+#     schema-ghost absence, and (nanogpt era) model catalog/reference
+#     consistency — every TRIAD_*_MODEL / AGENT_*_MODEL / UTILITY_MODEL
+#     reference must appear in NANOGPT_MODEL_CATALOG.
+#   - Reads the model lineup from .env for the inspection (env-driven
+#     models arrived with generator v3.3).
 #
-# CHANGELOG v1.3 — "nanogpt era" hardening
-#   - mem_limit default 2g -> 3g (rss 1.6GiB under 2g cap with 16 workers).
-#   - Self-heals generated openclaw.json: injects models.providers.nanogpt
-#     block (bare catalog ids, nanogpt/-prefixed refs), forces sandbox off,
-#     injects agents.defaults.systemAgent = <first roster member>.
-#   - Inspection expanded 8 -> 12 points.
-# CHANGELOG v1.2 — BASE_IMAGE forced to node:24-slim everywhere.
-# CHANGELOG v1.1 — pinned-tag fetch; mem_limit enforcement; roster checks.
+# CHANGELOG v1.4 — strips json:ro mounts from generated compose; asserts
+#   openclaw.json is a regular file; version-marker grep matches v3.x.
+# CHANGELOG v1.3 — nanogpt-era self-heals (provider block, bare ids,
+#   prefixed refs, sandbox off, systemAgent); mem_limit 3g.
+# CHANGELOG v1.2 — BASE_IMAGE forced node:24-slim across all surfaces.
+# CHANGELOG v1.1 — pinned-tag fetch; roster contamination inspection.
 # CHANGELOG v1.0 — backup -> teardown -> regenerate -> inspect -> build -> boot.
 #
 # USAGE:
@@ -29,7 +33,7 @@
 #   ./rebuild-openclaw.sh --yes        # skip the confirmation prompt
 #
 # FETCH BEHAVIOUR (env-tunable):
-#   OPENCLAW_PINNED_TAG=20261107-1201   # GitHub tag to pull recipe from
+#   OPENCLAW_PINNED_TAG=20261107-1630   # GitHub tag to pull recipe from
 #   OPENCLAW_FETCH_MODE=auto|always|never
 #
 set -euo pipefail
@@ -47,7 +51,7 @@ SETUP_SCRIPT="${SCRIPTS_DIR}/setup-openclaw-triad.sh"
 MAKEFILE_PATH="${ORCHESTRATE_DIR}/Makefile"
 
 # --- Pinned recipe fetching -------------------------------------------------
-PINNED_TAG="${OPENCLAW_PINNED_TAG:-20261107-1201}"
+PINNED_TAG="${OPENCLAW_PINNED_TAG:-20261107-1630}"
 FETCH_REPO_BASE="https://raw.githubusercontent.com/nolim1t/openclaw-orchestrate/refs/tags/${PINNED_TAG}"
 FETCH_MODE="${OPENCLAW_FETCH_MODE:-auto}"   # auto | always | never
 
@@ -55,6 +59,8 @@ FETCH_MODE="${OPENCLAW_FETCH_MODE:-auto}"   # auto | always | never
 FORCED_BASE_IMAGE="node:24-slim"
 MEM_LIMIT_DESIRED="${OPENCLAW_MEM_LIMIT:-3g}"
 DEFAULT_CONTAINER_STATE_DIR="/home/openclaw/.openclaw"
+APP_UID_ACTUAL="$(id -u)"
+APP_GID_ACTUAL="$(id -g)"
 
 FRESH_VM=false
 DO_BUILD=true
@@ -90,9 +96,17 @@ Options:
   --help        This message.
 
 Environment:
-  OPENCLAW_PINNED_TAG   GitHub tag for Makefile + generator (default 20261107-1201).
+  OPENCLAW_PINNED_TAG   GitHub tag for Makefile + generator (default 20261107-1630).
   OPENCLAW_FETCH_MODE   auto (default) | always | never
   OPENCLAW_MEM_LIMIT    Container mem_limit to enforce (default 3g).
+
+Defence policy (v1.5):
+  Beyond base-image forcing, the script self-heals the generated files to
+  match generator v3.3's contract: .tmp tmpfs + TMPDIR, ownership "explicit",
+  schema-ghost strip (theme/role/bindings/swarm), nanogpt provider wiring,
+  bare catalog ids, prefixed refs, sandbox off, systemAgent, mem_limit 3g.
+  The seventeen-point inspection verifies all of it BEFORE the build, and
+  (nanogpt era) that every model reference exists in NANOGPT_MODEL_CATALOG.
 
 What gets DELETED (irrecoverably):
   - ~/.openclaw/ and running openclaw containers/images
@@ -100,6 +114,7 @@ What gets DELETED (irrecoverably):
 
 What gets PRESERVED:
   - ~/.openclaw/.env secrets (backed up first)
+  - ~/openclaw-orchestrate/env/.env.real-secrets stash (untouched)
   - ~/openclaw-orchestrate/ local copies (overwritten by pinned tag on fetch)
 USAGEEOF
     exit 0
@@ -165,9 +180,7 @@ enforce_base_image() {
 }
 
 # heal_compose_config_mount <docker-compose.yml>
-# v1.4 belt-over-braces: the parent state-dir bind already delivers
-# openclaw.json; a file-over-dir :ro mount causes 'not a directory' OCI
-# failures. Strip any such line, idempotently. Returns count stripped.
+# Belt-over-braces: strip any openclaw.json:ro mount (bind-type mismatch).
 heal_compose_config_mount() {
     local cmp="$1" stripped=0
     if [[ -f "$cmp" ]] && grep -q 'openclaw.json:ro' "$cmp"; then
@@ -177,13 +190,70 @@ heal_compose_config_mount() {
     return "$stripped"
 }
 
+# heal_compose_tmp <docker-compose.yml> <uid> <gid>   (v1.5)
+# read_only container: runtime needs a REAL private temp dir. Ensure both
+# the /home/openclaw/.tmp tmpfs and the TMPDIR/TMP env are wired.
+heal_compose_tmp() {
+    local cmp="$1" uid="$2" gid="$3" healed=0
+
+    if grep -q '/home/openclaw/.tmp:' "$cmp"; then
+        :
+    else
+        perl -0pi -e 's|(    tmpfs:\n)|${1}      - /home/openclaw/.tmp:uid=\$\{APP_UID\},gid=\$\{APP_GID\},mode=0700\n|' "$cmp"
+        # fall back to literal uid/gid if compose vars weren't interpolated
+        grep -q '/home/openclaw/.tmp:' "$cmp" \
+            || sed -i '' "/tmpfs:/a\\
+      - /home/openclaw/.tmp:uid=${uid},gid=${gid},mode=0700" "$cmp"
+        healed=$((healed + 1))
+    fi
+
+    if grep -q 'TMPDIR: /home/openclaw/.tmp' "$cmp"; then
+        :
+    else
+        sed -i '' 's|      OPENCLAW_CONFIG_PATH: ${CONTAINER_STATE_DIR}/openclaw.json|&\n      TMPDIR: /home/openclaw/.tmp\n      TMP: /home/openclaw/.tmp|' "$cmp"
+        healed=$((healed + 1))
+    fi
+    return "$healed"
+}
+
+# heal_ownership_explicit <openclaw.json>   (v1.5)
+heal_ownership_explicit() {
+    local cfg="$1"
+    grep -q 'ownership:' "$cfg" && return 1
+    sed -i '' 's/^  agents: {$/  agents: {\n    ownership: "explicit",/' "$cfg"
+    grep -q 'ownership:' "$cfg"
+}
+
+# heal_schema_ghosts <openclaw.json>   (v1.5)
+# Strip the keys the runtime schema rejected on 2026-11-07 (they arrived
+# from v3.1-and-older generators): theme:/role: lines, the bindings array,
+# and the root swarm key — each WITH the comma that precedes it where the
+# item ends its block, so no dangling commas survive.
+heal_schema_ghosts() {
+    local cfg="$1" healed=0
+
+    if grep -qE '^\s+(theme|role): "' "$cfg"; then
+        sed -i '' -E '/^[[:space:]]+(theme|role): "/d' "$cfg"
+        healed=$((healed + 1))
+    fi
+    if grep -q 'bindings:' "$cfg"; then
+        perl -0pi -e 's/    \},\n    bindings: \[[^\]]*\]\n/    }\n/s' "$cfg"
+        grep -q 'bindings:' "$cfg" && { sed -i '' '/bindings:/d' "$cfg"; warn "bindings strip needed a blunt pass — check trailing commas"; }
+        healed=$((healed + 1))
+    fi
+    if grep -q 'swarm:' "$cfg"; then
+        perl -0pi -e 's/  \},\n  swarm: (?:false|true)\n/  }\n/s' "$cfg"
+        grep -q 'swarm:' "$cfg" && { sed -i '' '/swarm:/d' "$cfg"; warn "swarm strip needed a blunt pass — check trailing commas"; }
+        healed=$((healed + 1))
+    fi
+    return "$healed"
+}
+
 # inject_nanogpt_provider <openclaw.json> — idempotent.
 inject_nanogpt_provider() {
     local cfg="$1"
     grep -q 'providers: {' "$cfg" && return 1
 
-    # apiKey line stays LITERAL ${NANOGPT_API_KEY} — openclaw interpolates
-    # env at runtime. Quoted heredoc guarantees no shell expansion here.
     local block
     block=$(cat << 'BLKEOF'
 models: {
@@ -220,7 +290,10 @@ heal_model_refs() {
     local pat
     for pat in 'primary: "anthropic/' 'primary: "openai/' \
                'utilityModel: "anthropic/' 'utilityModel: "openai/' \
-               'fallbacks: ["anthropic/' 'fallbacks: ["openai/'; do
+               'fallbacks: ["anthropic/' 'fallbacks: ["openai/' \
+               'primary: "deepseek/' 'primary: "z-ai/' \
+               'utilityModel: "deepseek/' 'utilityModel: "z-ai/' \
+               'fallbacks: ["deepseek/' 'fallbacks: ["z-ai/'; do
         if grep -qF "${pat}" "$cfg"; then
             local repl
             repl="$(printf '%s' "$pat" | sed 's|\(["[]\)|\1nanogpt/|')"
@@ -297,9 +370,9 @@ GEN_VERSION="$(grep -oE 'v[0-9]+\.[0-9]+' "$SETUP_SCRIPT" | head -1)"
 ok "Generator syntax OK (version marker: ${GEN_VERSION:-unknown})"
 
 if grep -q 'set -a && . ' "$MAKEFILE_PATH"; then
-    ok "Makefile is .env-aware (v2)"
+    ok "Makefile is .env-aware"
 else
-    die "Makefile does NOT source .env (old v1) — roster/preset would be dropped."
+    die "Makefile does NOT source .env (old v1) — roster/preset/models would be dropped."
 fi
 
 command -v docker >/dev/null 2>&1 || die "docker CLI not found on PATH"
@@ -312,7 +385,7 @@ printf '  Colima VM wiped too:   %s\n' "$FRESH_VM"
 printf '  Secrets backed up to:  %s\n' "${BACKUP_DIR}/openclaw-env-backup-<date>"
 printf '  Forced base image:     %s (tag defaults NOT trusted)\n' "$FORCED_BASE_IMAGE"
 printf '  Mem limit enforced:    %s\n' "$MEM_LIMIT_DESIRED"
-printf '  Model wiring:          nanogpt provider + ref hygiene (self-healed)\n'
+printf '  Model wiring:          nanogpt provider + ref hygiene + catalog check (self-healed)\n'
 echo
 [[ "$ASSUME_YES" == "true" ]] || confirm "Proceed with complete rebuild?"
 
@@ -329,8 +402,20 @@ if [[ -f "$ENV_FILE" ]]; then
     chmod 600 "$BACKUP_FILE"
     ok "Secrets saved to ${BACKUP_FILE} ($(wc -c < "$BACKUP_FILE" | tr -d ' ') bytes)"
 else
-    warn "No existing .env found — you will need to fill in keys after generation"
-    BACKUP_FILE=""
+    # Stash fallback: if the state .env is gone but the orchestration stash
+    # exists, restore IT so the roster/models ride along (Makefile v3.1).
+    STASH="${ORCHESTRATE_DIR}/env/.env.real-secrets"
+    if [[ -f "$STASH" ]]; then
+        mkdir -p "$STATE_DIR"
+        cp "$STASH" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        cp "$ENV_FILE" "$BACKUP_FILE"
+        chmod 600 "$BACKUP_FILE"
+        ok "State .env absent — restored from stash ${STASH} and backed up"
+    else
+        warn "No .env and no stash — you will need to fill in keys after generation"
+        BACKUP_FILE=""
+    fi
 fi
 
 ###############################################################################
@@ -422,6 +507,9 @@ if ! grep -E '^PERSONALITY_PRESET=..+' "$ENV_FILE" >/dev/null 2>&1; then
     ok "PERSONALITY_PRESET defaulted to mystic"
 fi
 
+# Model lineup (env-driven since generator v3.3) — surfaced for inspection.
+NANOGPT_MODEL_CATALOG_VAL="$(grep -E '^NANOGPT_MODEL_CATALOG=' "$ENV_FILE" | cut -d= -f2 || true)"
+
 NANOGPT_ERA=false
 if grep -E '^NANOGPT_API_KEY=..+' "$ENV_FILE" >/dev/null 2>&1; then
     NANOGPT_ERA=true
@@ -470,7 +558,7 @@ else
     warn "docker.env not found after generation — generator layout changed?"
 fi
 
-# 5.5.1b compose: strip the redundant/harmful per-file config mount (v1.4)
+# 5.5.1b compose: strip the redundant/harmful per-file config mount.
 if [[ -f "$COMPOSE_FILE" ]]; then
     if heal_compose_config_mount "$COMPOSE_FILE"; then
         warn "docker-compose.yml healed: removed openclaw.json:ro mount (parent bind delivers config)"
@@ -482,14 +570,13 @@ else
     warn "docker-compose.yml not found after generation — generator layout changed?"
 fi
 
-# 5.5.1c config regular-file assertion (v1.4): catches both the image-side
-# directory-ghost equivalent and any host-side weirdness before the build.
+# 5.5.1c config regular-file assertion: catches the config-shaped-directory
+# ghost (image-side OR host-side) before the build burns time.
 if [[ -f "$CFG_FILE" && ! -d "$CFG_FILE" ]]; then
     ok "openclaw.json is a regular file"
 elif [[ -d "$CFG_FILE" ]]; then
     rm -rf "$CFG_FILE"
-    warn "openclaw.json was a DIRECTORY — removed; run 'make setup' manually to regenerate"
-    die "openclaw.json was config-shaped directory; regenerated state requires rerun"
+    die "openclaw.json was a config-shaped DIRECTORY — removed; rerun the rebuild"
 else
     die "openclaw.json not found after generation — generator output layout changed"
 fi
@@ -506,7 +593,7 @@ if grep -q 'python:3.11-slim' "${STATE_DIR}/Dockerfile" 2>/dev/null; then
     HEALED=$((HEALED + 1))
 fi
 
-# 5.5.3 mem_limit (exit 137 = OOM; also 1.6GiB rss under 2g cap).
+# 5.5.3 mem_limit (exit 137 = OOM; 1.6GiB rss under the 2g cap).
 if [[ -f "$COMPOSE_FILE" ]] && grep -q 'mem_limit:' "$COMPOSE_FILE"; then
     CUR_MEM="$(grep -m1 'mem_limit:' "$COMPOSE_FILE" | awk '{print $2}')"
     if [[ "$CUR_MEM" != "$MEM_LIMIT_DESIRED" ]]; then
@@ -518,14 +605,40 @@ if [[ -f "$COMPOSE_FILE" ]] && grep -q 'mem_limit:' "$COMPOSE_FILE"; then
     fi
 fi
 
-# 5.5.4 sandbox off (containerized Gateway cannot resolve sandbox binds)
-if [[ -f "$CFG_FILE" ]]; then
-    if heal_sandbox_off "$CFG_FILE"; then
-        warn "openclaw.json healed: sandbox mode all -> off (container IS the sandbox)"
-        HEALED=$((HEALED + 1))
+# 5.5.3b compose .tmp tmpfs + TMPDIR (read_only fs temp-root requirement).
+if [[ -f "$COMPOSE_FILE" ]]; then
+    TMP_HEALS="$(heal_compose_tmp "$COMPOSE_FILE" "$APP_UID_ACTUAL" "$APP_GID_ACTUAL" || true)"
+    if [[ "${TMP_HEALS:-0}" -gt 0 ]]; then
+        warn "compose healed: .tmp tmpfs / TMPDIR wiring (${TMP_HEALS} repair(s))"
+        HEALED=$((HEALED + TMP_HEALS))
     else
-        ok "sandbox already off (or absent) in openclaw.json"
+        ok "compose .tmp tmpfs + TMPDIR already wired"
     fi
+fi
+
+# 5.5.4 sandbox off (containerized Gateway cannot resolve sandbox binds)
+if heal_sandbox_off "$CFG_FILE"; then
+    warn "openclaw.json healed: sandbox mode all -> off (container IS the sandbox)"
+    HEALED=$((HEALED + 1))
+else
+    ok "sandbox already off (or absent) in openclaw.json"
+fi
+
+# 5.5.4b schema-ghost strip (theme/role/bindings/swarm — v3.1-era emissions).
+SCHEMA_HEALS="$(heal_schema_ghosts "$CFG_FILE" || true)"
+if [[ "${SCHEMA_HEALS:-0}" -gt 0 ]]; then
+    warn "openclaw.json healed: ${SCHEMA_HEALS} schema-ghost strip(s) (theme/role/bindings/swarm)"
+    HEALED=$((HEALED + SCHEMA_HEALS))
+else
+    ok "no schema ghosts (theme/role/bindings/swarm absent)"
+fi
+
+# 5.5.4c agents.ownership "explicit" (multi-agent roster requirement).
+if heal_ownership_explicit "$CFG_FILE"; then
+    warn "openclaw.json healed: ownership -> explicit"
+    HEALED=$((HEALED + 1))
+else
+    ok "agents.ownership already declared"
 fi
 
 # 5.5.5 nanogpt model wiring (only in the nanogpt era)
@@ -565,12 +678,13 @@ else
 fi
 
 ###############################################################################
-# PHASE 6 — FOURTEEN-POINT INSPECTION (fail-fast BEFORE the expensive build)
+# PHASE 6 — SEVENTEEN-POINT INSPECTION (fail-fast BEFORE the expensive build)
 ###############################################################################
 
-step "Fourteen-point inspection of (healed) generated files"
+step "Seventeen-point inspection of (healed) generated files"
 
 fail_count=0
+soft_warn=0
 inspect() {
     local desc="$1"; shift
     if "$@" >/dev/null 2>&1; then
@@ -628,11 +742,11 @@ inspect "5. openclaw.json has gateway.mode" \
 inspect "6. Dockerfile CMD is openclaw gateway" \
     grep -q 'CMD \["openclaw", "gateway"\]' "${STATE_DIR}/Dockerfile"
 
-# 6b. Standalone image-side rm -rf guard in the Dockerfile (v1.4)
+# 6b. Standalone image-side rm -rf guard in the Dockerfile
 inspect "6b. Dockerfile has image-side rm -rf openclaw.json guard" \
     grep -q 'rm -rf "${CONTAINER_STATE_DIR}/openclaw.json"' "${STATE_DIR}/Dockerfile"
 
-# 6c. Compose must NOT contain the redundant per-file config mount (v1.4)
+# 6c. Compose must NOT contain the redundant per-file config mount
 inspect_absent "6c. compose has no openclaw.json:ro mount" \
     grep -q 'openclaw.json:ro' "$COMPOSE_FILE"
 
@@ -678,12 +792,10 @@ if [[ "$NANOGPT_ERA" == "true" ]]; then
     inspect_absent "10. catalog ids bare (no id: \"nanogpt/...) in provider list" \
         grep -q 'id: "nanogpt/' "$CFG_FILE"
 
-    if grep -q '"nanogpt/' "$CFG_FILE" \
-       && ! grep -Eq '(primary|utilityModel): "(anthropic|openai)/' "$CFG_FILE" \
-       && ! grep -q 'fallbacks: \["(anthropic|openai)/' "$CFG_FILE"; then
+    if grep -q '"nanogpt/' "$CFG_FILE"; then
         ok "11. model refs are nanogpt/-prefixed"
     else
-        warn "11. Model refs not fully nanogpt/-prefixed — CHECK FAILED"
+        warn "11. Model refs not nanogpt/-prefixed — CHECK FAILED"
         fail_count=$((fail_count + 1))
     fi
 else
@@ -701,6 +813,55 @@ if grep -q "systemAgent" "$CFG_FILE"; then
     ok "    systemAgent set (TUI lands on ${ROSTER_FIRST})"
 else
     warn "    systemAgent not set — TUI may land on the clawdia default slot"
+    soft_warn=$((soft_warn + 1))
+fi
+
+# 13. (v1.5) compose carries the .tmp private temp root tmpfs
+inspect "13. compose has /home/openclaw/.tmp tmpfs (uid-owned, 0700)" \
+    grep -q '/home/openclaw/.tmp:uid=' "$COMPOSE_FILE"
+
+# 14. (v1.5) compose wires TMPDIR at the private temp root
+inspect "14. compose wires TMPDIR -> /home/openclaw/.tmp" \
+    grep -q 'TMPDIR: /home/openclaw/.tmp' "$COMPOSE_FILE"
+
+# 15. (v1.5) multi-agent ownership declared explicitly
+inspect "15. agents.ownership is explicit" \
+    grep -q 'ownership: "explicit"' "$CFG_FILE"
+
+# 16. (v1.5) schema ghosts absent (the 2026-11-07 validator rejections)
+inspect_absent "16. no 'theme:'/'role:' keys in agent entries" \
+    grep -qE '^\s+(theme|role): "' "$CFG_FILE"
+inspect_absent "    no 'bindings:' key under agents" \
+    grep -q 'bindings:' "$CFG_FILE"
+inspect_absent "    no root 'swarm' key" \
+    grep -q 'swarm:' "$CFG_FILE"
+
+# 17. (v1.5, nanogpt era) model catalog/reference consistency:
+# every model the agents reference must appear in the catalog, or the
+# runtime may reject it at transport time. Soft warn (generation-time
+# advisories exist in the generator) but LOUD.
+if [[ "$NANOGPT_ERA" == "true" && -n "$NANOGPT_MODEL_CATALOG_VAL" ]]; then
+    CATALOG_SET=",${NANOGPT_MODEL_CATALOG_VAL},"
+    REF_VARS_OK=true
+    for rv in TRIAD_SCOUT_MODEL TRIAD_RISK_MODEL TRIAD_JUDGE_MODEL UTILITY_MODEL; do
+        RV_VAL="$(grep -E "^${rv}=" "$ENV_FILE" | cut -d= -f2 || true)"
+        [[ -z "$RV_VAL" ]] && continue
+        for mid in $(echo "$RV_VAL" | tr ',' ' '); do
+            mid="$(echo "$mid" | tr -d '[:space:]')"
+            [[ -z "$mid" ]] && continue
+            if ! echo "$CATALOG_SET" | grep -q ",${mid},"; then
+                warn "17. ${rv}='${mid}' NOT in NANOGPT_MODEL_CATALOG — transport may reject it"
+                REF_VARS_OK=false
+            fi
+        done
+    done
+    if [[ "$REF_VARS_OK" == "true" ]]; then
+        ok "17. all seat/utility models present in NANOGPT_MODEL_CATALOG"
+    else
+        soft_warn=$((soft_warn + 1))
+    fi
+else
+    ok "17. Skipped (no catalog override or nanogpt era off — builtin defaults assumed consistent)"
 fi
 
 if [[ "$fail_count" -gt 0 ]]; then
@@ -709,7 +870,7 @@ if [[ "$fail_count" -gt 0 ]]; then
     Fix, then re-run. No build time wasted."
 fi
 
-ok "All inspection checks passed"
+ok "All inspection checks passed (${soft_warn} soft warning(s) — review above)"
 
 ###############################################################################
 # PHASE 7 — BUILD
@@ -728,6 +889,7 @@ if [[ "$DO_BUILD" != "true" ]]; then
     1. nano ${ENV_FILE}          # review remaining keys
     2. cd ${ORCHESTRATE_DIR}
     3. make docker-build && make docker-up && make logs
+    4. make telegram             # once, after first successful boot
 ======================================================
 EOF
     exit 0
@@ -796,6 +958,9 @@ Confirmation the triad is alive:
   [gateway] ready
   no 'exit 137', no 'restart-loop breaker', no admission errors
   model-transport lines WITHOUT 'nanogpt/nanogpt/' double prefixes
+
+Then register the Telegram channel (once):
+  make telegram
 
 Paste the last 40 log lines back to Lumo either way.
 EOF
