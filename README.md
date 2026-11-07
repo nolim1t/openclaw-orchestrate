@@ -8,11 +8,11 @@ A three-agent trading council running on [OpenClaw](https://openclaw.com) inside
 
 Three agents, three positions, one chain of custody:
 
-| Position | Role | Tools | Model (default) |
-|---|---|---|---|
-| **Scout** (roster #1) | Research and propose trades | read, write, exec, message | Claude Sonnet 4.6 |
-| **Risk** (roster #2) | Validate or veto every proposal; co-sign approvals; treasury custodian | read, write, exec, message | Claude Opus 4.6 |
-| **Judge** (roster #3) | Binding rulings on disputes; read-only by design | read, message | Claude Opus 4.6 |
+| Position | Role | Tools |
+|---|---|---|
+| **Scout** (roster #1) | Research and propose trades | read, write, exec, message |
+| **Risk** (roster #2) | Validate or veto every proposal; co-sign approvals; treasury custodian | read, write, exec, message |
+| **Judge** (roster #3) | Binding rulings on disputes; read-only by design | read, message |
 
 The judge is read-only on purpose: *a mediator who can alter the record isn't a mediator.* Current production roster: `clawdina` (scout) / `clawde` (risk) / `thesource` (judge).
 
@@ -33,7 +33,7 @@ Every decision is logged to append-only calibration CSVs in `shared/calibration/
 │   ├── .env.example              # shape-only template (committable)
 │   └── .env.real-secrets         # your ACTUAL keys — gitignored, never commit
 └── scripts/
-    ├── setup-openclaw-triad.sh    # generator (v3.2) — emits the whole stack
+    ├── setup-openclaw-triad.sh    # generator (v3.3) — emits the whole stack
     └── rebuild-openclaw.sh        # one-command from-scratch rebuild (v1.4+)
 
 ~/.openclaw/                      # STATE DIR (generated, mostly disposable)
@@ -48,6 +48,74 @@ Every decision is logged to append-only calibration CSVs in `shared/calibration/
 ```
 
 The secrets stash (`env/.env.real-secrets`) lives **outside** the state dir so it survives `make wipe` and state-dir deletion. The rebuild script only ever fetches `Makefile` and `scripts/setup-openclaw-triad.sh` from the pinned tag — your stash is never clobbered.
+
+---
+
+## Specifying Models
+
+The model lineup is **entirely `.env`-driven** since generator v3.3. No script edits, no sed surgery — edit `.env`, regenerate, restart.
+
+### The two spelling rules (memorize these)
+
+Two audiences read model names, and each expects a different spelling:
+
+1. **Catalog ids** inside `providers.nanogpt.models` are **BARE** — `deepseek/deepseek-v4.1-flash-1017`. This is what NanoGPT's API expects.
+2. **References** elsewhere (`primary`, `utilityModel`, `fallbacks`) are **`nanogpt/`-prefixed** — `nanogpt/deepseek/deepseek-v4.1-flash-1017`. This is what openclaw's router expects.
+
+The generator and the rebuild's self-heals both enforce this automatically. In your `.env` you always write **bare ids**; the generator adds the prefix. A `nanogpt/nanogpt/` double prefix in the logs means something upstream regressed.
+
+### The model variables
+
+All in `~/.openclaw/.env`:
+
+| Variable | Controls | Example value |
+|---|---|---|
+| `NANOGPT_MODEL_CATALOG` | The provider's catalog list (comma-separated). Entry format: `vendor/model-id` or `vendor/model-id\|Display Name` (display name defaults to the id's last segment) | `deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3,z-ai/glm-5.3-flash-uncensored` |
+| `TRIAD_SCOUT_MODEL` | Position default for the scout (roster #1) | `deepseek/deepseek-v4.1-flash-1017` |
+| `TRIAD_RISK_MODEL` | Position default for risk/veto (roster #2) | `z-ai/glm-5.3` |
+| `TRIAD_JUDGE_MODEL` | Position default for the judge (roster #3) | `z-ai/glm-5.3` |
+| `UTILITY_MODEL` | Utility + fallback slot for all agents | `z-ai/glm-5.3-flash-uncensored` |
+| `AGENT_<NAME>_MODEL` | Per-agent override (highest precedence) | `AGENT_THESOURCE_MODEL=z-ai/glm-5.3` |
+
+**Precedence per agent:** `AGENT_<NAME>_MODEL` > `TRIAD_<POSITION>_MODEL` > builtin default.
+
+### Worked example: switching to a DeepSeek/GLM subscription
+
+If your NanoGPT subscription doesn't include the Claude/GPT lineup (as happened 2026-11-07), set in `.env`:
+
+```bash
+# Catalog: every model ANY agent will reference must appear here.
+NANOGPT_MODEL_CATALOG=deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3,z-ai/glm-5.3-flash-uncensored
+
+# Seat assignment: fast scanner scouts, heavyweights guard and judge.
+TRIAD_SCOUT_MODEL=deepseek/deepseek-v4.1-flash-1017
+TRIAD_RISK_MODEL=z-ai/glm-5.3
+TRIAD_JUDGE_MODEL=z-ai/glm-5.3
+UTILITY_MODEL=z-ai/glm-5.3-flash-uncensored
+```
+
+Then apply:
+
+```bash
+cd ~/openclaw-orchestrate
+make secrets-save        # persist the lineup (the stash captures all of .env)
+make setup               # regenerate openclaw.json from .env
+make docker-up           # recreate the container (config is read at boot)
+```
+
+Verify in the boot logs — each agent's line should show the new model, single-prefixed:
+
+```
+[gateway] agent model: nanogpt/deepseek/deepseek-v4.1-flash-1017 (thinking=medium, fast=off)
+```
+
+### Consistency guardrail
+
+The generator cross-checks every model **reference** against the **catalog** and prints a loud `[!] ADVISORY` at generation time for any referenced model missing from the catalog. That's your early warning that the runtime may reject the model at transport time — fix the `.env`, not the generated file.
+
+### Changing models on a running stack (emergency only)
+
+If you can't regenerate right now, edit `~/.openclaw/openclaw.json` directly — catalog ids bare, references `nanogpt/`-prefixed — then `docker compose --env-file docker.env up -d --force-recreate`. But know that the next `make setup` overwrites your hand edit, so always land the change in `.env` afterwards.
 
 ---
 
@@ -82,7 +150,7 @@ make status        # deployment + state health (incl. secrets stash)
 make agents        # show roster + preset
 make shell         # shell into the container
 make docker-down   # stop (state preserved)
-make secrets-save  # after editing .env — persist keys to the stash
+make secrets-save  # after editing .env — persist keys/lineup to the stash
 make wipe          # DANGER: delete ALL state (requires typing WIPE)
 ```
 
@@ -96,15 +164,16 @@ make wipe          # DANGER: delete ALL state (requires typing WIPE)
 | `OPENCLAW_GATEWAY_TOKEN` | Gateway auth (auto-generated if absent) | random hex |
 | `AGENT_ROSTER` | Exactly 3 names, comma-separated (scout,risk,judge) | seer,guardian,sage |
 | `PERSONALITY_PRESET` | default \| mystic \| bold \| conservative \| quant | default |
+| `NANOGPT_MODEL_CATALOG` | Provider catalog (see Specifying Models) | Claude/GPT lineup |
+| `TRIAD_SCOUT/RISK/JUDGE_MODEL` | Position model defaults | Claude lineup |
+| `UTILITY_MODEL` | Utility + fallback model | openai/gpt-5.4-mini |
+| `AGENT_<NAME>_MODEL` | Per-agent override (wins over everything) | — |
 | `TELEGRAM_BOT_TOKEN` | Telegram channel | — |
 | `TELEGRAM_USER_ID` | Comma-separated allowlist of Telegram user IDs | — |
 | `ELEVENLABS_API_KEY` | Per-agent TTS voices | — |
-| `AGENT_<NAME>_MODEL` | Per-agent model override | position defaults |
 | `BASE_IMAGE` | Docker base image (**forced to node:24-slim**) | node:24-slim |
 | `OPENCLAW_VERSION` | openclaw npm version | latest |
 | `DOCKER_ENABLE` | Emit Docker files | true (via Makefile) |
-
-**Model spelling rules (two audiences):** catalog ids inside the provider list are BARE (`anthropic/claude-sonnet-4-6` — that's what NanoGPT's API expects); model *references* elsewhere are `nanogpt/`-prefixed (that's what openclaw's router expects). The generator and the rebuild's self-heals both enforce this; a double prefix (`nanogpt/nanogpt/`) in the logs means one of them regressed.
 
 ---
 
@@ -117,7 +186,7 @@ make wipe          # DANGER: delete ALL state (requires typing WIPE)
    ```
 3. Message your bot from the allowlisted account. Unauthorized senders are silently ignored (by design).
 
-The legacy `plugins/telegram-bot/bot.py` (roster-aware slash commands: `/clawdina hello`) remains as a fallback if the runtime channel route is unavailable.
+The legacy `plugins/telegram-bot/bot.py` (roster-aware slash commands) remains as a fallback if the runtime channel route is unavailable.
 
 ---
 
@@ -144,7 +213,7 @@ Tag names are opaque strings to git. Whatever you pick, just use it consistently
 
 ## Troubleshooting Playbook (battle log)
 
-Each of these was a real boot failure. All are fixed at the generator level as of v3.2.
+Each of these was a real boot failure. All are fixed at the generator level as of v3.3.
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -156,8 +225,9 @@ Each of these was a real boot failure. All are fixed at the generator level as o
 | Config validation: *Unrecognized keys* `theme`, `role`, `bindings`, `swarm`; *agents.ownership* required | Generator emitted fields outside the runtime schema | v3.2 emits schema-valid config; personas live in AGENTS.md |
 | Startup: `Unable to create fallback OpenClaw temp dir: /tmp/openclaw-<uid>` | `read_only` root fs; runtime refuses shared /tmp | Second tmpfs `/home/openclaw/.tmp` (uid-owned, 0700) + `TMPDIR` env |
 | Startup: config rejected, host paths visible | Config had `/Users/...` paths inside a containerized runtime | All config paths are container paths; host paths only in compose/docker.env |
+| Model transport errors / agents silent on reply | Referenced model not in the subscription or not in the catalog | v3.3 advisory warns at generation; fix `NANOGPT_MODEL_CATALOG` in `.env` |
 | Agent-DB integrity gate in logs | State-dir sqlite inconsistency | `openclaw doctor --fix` via the run-command in the rebuild summary |
-| Boot-race errors right after `[gateway] ready` (`usage-cost-cache`, `AgentDatabaseRegistryChangedError`) | Concurrent discovery settling during subagent-recovery | Transient: check if they persist after ~5 min before investigating |
+| Boot-race errors right after `[gateway] ready` | Concurrent discovery settling during subagent-recovery | Transient: check if they persist after ~5 min before investigating |
 
 **Health confirmation:** `[gateway] ready` in logs, roster names registering, no `exit 137`, no restart-loop breaker, model-transport lines without `nanogpt/nanogpt/` double prefixes.
 
@@ -184,6 +254,6 @@ Weekly ritual: each agent reviews its calibration hit-rate from `shared/calibrat
 
 | Component | Version | Milestone |
 |---|---|---|
-| setup-openclaw-triad.sh | v3.2 | Schema-valid config; .tmp tmpfs + TMPDIR; verbatim names; runtime-channel Telegram |
+| setup-openclaw-triad.sh | v3.3 | Env-driven model catalog + position defaults; catalog/reference consistency advisories |
 | rebuild-openclaw.sh | v1.4 | 14-point inspection; json:ro heal; config regular-file assertion |
 | Makefile | v3 | Secrets stash lifecycle (save/restore); telegram target; status shows stash |

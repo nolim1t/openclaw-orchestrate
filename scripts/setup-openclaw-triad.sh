@@ -1,37 +1,32 @@
 #!/usr/bin/env bash
 #
-# setup-openclaw-triad.sh (v3.2)
+# setup-openclaw-triad.sh (v3.3)
 #
-# Consolidates every fix from the 2026-11-07 deployment saga.
+# CHANGELOG v3.3 (vs v3.2) — "env-driven models"
+#   - The model lineup is now ENTIRELY env-driven; the Claude/GPT defaults
+#     are just fallbacks. Changing providers/models is a .env edit, not a
+#     script edit:
+#       NANOGPT_MODEL_CATALOG   comma list for providers.nanogpt.models.
+#                               Each entry: "vendor/model-id" or
+#                               "vendor/model-id|Display Name" (display
+#                               name defaults to the id's last segment).
+#                               Catalog ids stay BARE (NanoGPT's API).
+#       TRIAD_SCOUT_MODEL       position default for the scout (roster #1)
+#       TRIAD_RISK_MODEL        position default for the risk/veto (roster #2)
+#       TRIAD_JUDGE_MODEL       position default for the judge (roster #3)
+#       UTILITY_MODEL           utility + fallback slot (unchanged from v3.2)
+#       AGENT_<NAME>_MODEL      per-agent override, still wins over everything
+#   - Catalog/reference consistency check: after assembling the config,
+#     any nanogpt-era model reference missing from the catalog prints a
+#     loud advisory (the runtime may reject unknown models at transport).
+#   - Seeded .env now documents all model knobs.
 #
-# CHANGELOG v3.2 (vs v3.1) — "schema-valid + writable temp"
-#   CONFIG (openclaw.json) — validated against the live runtime schema:
-#     - REMOVED theme:/role: from agent entries (Unrecognized keys);
-#       personas live in agents' AGENTS.md / DREAMS.md, their true home.
-#     - ADDED agents.ownership: "explicit" (multi-agent roster requirement).
-#     - REMOVED agents.bindings (Unrecognized key) — Telegram channel
-#       registration happens at runtime via `openclaw channels add telegram`
-#       (the runtime suppressed ambient env credentials and told us the
-#       correct mechanism on 2026-11-07).
-#     - REMOVED root-level swarm key (Unrecognized key).
-#     - Display name is the roster name VERBATIM ("thesource" stays
-#       "thesource"; naive capitalization produced "Thesource").
-#   COMPOSE:
-#     - Second tmpfs /home/openclaw/.tmp (uid/gid matched, 0700) plus
-#       TMPDIR/TMP env pointing at it. Root fs is read_only; the runtime's
-#       secure-temp requirements demand a REAL private dir — /tmp is not
-#       writable and fails with "Unable to create fallback OpenClaw temp dir".
-#   GENERAL:
-#     - Post-generation summary reminds about `openclaw channels add telegram`
-#       when TELEGRAM_BOT_TOKEN is present.
-#
-# CHANGELOG v3.1 (vs v3.0)
-#     - --non-interactive/--yes accepted as no-ops (v2.5 Makefile compat).
-#     - Standalone RUN rm -rf guard in Dockerfile; dropped openclaw.json:ro
-#       mount (bind-type mismatch); mem_limit 3g (exit 137 under 2g); sandbox
-#       off (container IS the sandbox); nanogpt wiring (bare catalog ids,
-#       nanogpt/-prefixed refs); systemAgent; container paths throughout;
-#       BASE_IMAGE node:24-slim; .env stewardship; bash 3.2 safe.
+# CHANGELOG v3.2 — schema-valid config (ownership "explicit", no
+#   theme/role/bindings/swarm, verbatim names); .tmp tmpfs + TMPDIR in
+#   compose; Telegram via runtime channel (`openclaw channels add telegram`).
+# CHANGELOG v3.1 — standalone rm -rf guard; no json:ro mount; mem_limit 3g;
+#   sandbox off; nanogpt wiring (bare ids, prefixed refs); systemAgent;
+#   container paths; node:24-slim; .env stewardship; bash 3.2 safe.
 #
 set -euo pipefail
 
@@ -41,15 +36,15 @@ set -euo pipefail
 
 usage() {
     cat << 'USAGEEOF'
-setup-openclaw-triad.sh (v3.2) — generate the full OpenClaw triad stack.
+setup-openclaw-triad.sh (v3.3) — generate the full OpenClaw triad stack.
 
 Generates into OPENCLAW_STATE_DIR (default ~/.openclaw):
   openclaw.json        Gateway config (schema-valid, container paths)
-  agents/*/           Agent dirs (DBs created by runtime)
+  agents/*/            Agent dirs (DBs created by runtime)
   workspace-triad/     Per-agent workspaces, journals, dreams, calibration
   shared/              Append-only ledgers + calibration CSVs
   plugins/telegram-bot/bot.py   Legacy Telegram front-end (fallback only)
-  tmp/ state/ logs/    Runtime dirs (lock files, leases, rotated logs)
+  tmp/ state/ logs/    Runtime dirs
   .gitignore           Keeps secrets + runtime state out of any repo
   Docker:
     Dockerfile         node:24-slim + openclaw runtime + image-side guard
@@ -57,17 +52,30 @@ Generates into OPENCLAW_STATE_DIR (default ~/.openclaw):
                        TMPDIR wired, locked-down runtime
     docker.env         Interpolation vars (NO secrets — committable)
 
-Env-driven configuration (read from the environment; Makefile sources .env):
+MODEL LINEUP (all env-driven since v3.3; set in .env, no script edits):
+  NANOGPT_MODEL_CATALOG   comma list; entry = "vendor/model-id" or
+                          "vendor/model-id|Display Name". BARE ids — this is
+                          what NanoGPT's API expects. Example:
+                          NANOGPT_MODEL_CATALOG=deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3,z-ai/glm-5.3-flash-uncensored
+  TRIAD_SCOUT_MODEL       position default, scout (roster #1)
+  TRIAD_RISK_MODEL        position default, risk/veto (roster #2)
+  TRIAD_JUDGE_MODEL       position default, judge (roster #3)
+  UTILITY_MODEL           utility + fallback model
+  AGENT_<NAME>_MODEL      per-agent override — highest precedence
+
+  Precedence (per agent): AGENT_<NAME>_MODEL > TRIAD_<POSITION>_MODEL >
+  builtin default. References are emitted nanogpt/-prefixed (router expects
+  that); catalog ids stay bare. Never mix the two spellings.
+
+Other env-driven configuration (Makefile sources .env):
   AGENT_ROSTER             comma list, default seer,guardian,sage
-                           (position 1 = scout/proposer, 2 = risk/veto,
-                            3 = judge/read-only ruler)
+                           (position 1 = scout, 2 = risk/veto, 3 = judge)
   PERSONALITY_PRESET       default|mystic|bold|conservative|quant
   NANOGPT_API_KEY          enables nanogpt model provider wiring
-  OPENCLAW_GATEWAY_TOKEN   required for network-bound gateway auth
+  OPENCLAW_GATEWAY_TOKEN   gateway auth
   TELEGRAM_BOT_TOKEN       enables telegram channel wiring
   TELEGRAM_USER_ID         comma-separated allowlist for the bot
   ELEVENLABS_API_KEY       enables per-agent TTS voices
-  AGENT_<NAME>_MODEL/THINKING/VOICE   per-agent overrides
   BASE_IMAGE               default node:24-slim
   OPENCLAW_VERSION         npm version of openclaw runtime (default latest)
   DOCKER_ENABLE=true       emit Docker files (or pass --docker)
@@ -152,6 +160,42 @@ JUDGE="${ROSTER[2]}"
 
 PRESET="${PERSONALITY_PRESET:-default}"
 
+# --- Model lineup (env-driven since v3.3) ------------------------------------
+# Catalog entries: "vendor/model-id" or "vendor/model-id|Display Name".
+# Ids stay BARE here (NanoGPT's API audience); references elsewhere are
+# nanogpt/-prefixed (openclaw router audience). Two audiences, two spellings.
+NANOGPT_MODEL_CATALOG_RAW="${NANOGPT_MODEL_CATALOG:-anthropic/claude-sonnet-4-6,anthropic/claude-opus-4-6,openai/gpt-5.4-mini}"
+CATALOG=()
+IFS=',' read -ra _mc <<< "$NANOGPT_MODEL_CATALOG_RAW"
+for _e in "${_mc[@]}"; do
+    _e="$(echo "$_e" | tr -d '[:space:]')"
+    [[ -n "$_e" ]] && CATALOG+=("$_e")
+done
+[[ "${#CATALOG[@]}" -gt 0 ]] || { echo "ERROR: NANOGPT_MODEL_CATALOG parsed empty (got: ${NANOGPT_MODEL_CATALOG_RAW})" >&2; exit 1; }
+
+catalog_id()   { echo "${1%%|*}"; }
+catalog_name() {
+    local e="$1"
+    if [[ "$e" == *"|"* ]]; then
+        echo "${e#*|}"
+    else
+        echo "$(catalog_id "$e")" | awk -F/ '{print $NF}'
+    fi
+}
+catalog_has() {
+    local want="$1" e
+    for e in "${CATALOG[@]}"; do
+        [[ "$(catalog_id "$e")" == "$want" ]] && return 0
+    done
+    return 1
+}
+
+# Position defaults (per-agent AGENT_<NAME>_MODEL still overrides these).
+TRIAD_SCOUT_MODEL="${TRIAD_SCOUT_MODEL:-anthropic/claude-sonnet-4-6}"
+TRIAD_RISK_MODEL="${TRIAD_RISK_MODEL:-anthropic/claude-opus-4-6}"
+TRIAD_JUDGE_MODEL="${TRIAD_JUDGE_MODEL:-anthropic/claude-opus-4-6}"
+UTILITY_MODEL="${UTILITY_MODEL:-openai/gpt-5.4-mini}"
+
 # --- Feature detection -------------------------------------------------------
 NANOGPT_KEY="${NANOGPT_API_KEY:-}"
 NANOGPT_ERA=false; [[ -n "$NANOGPT_KEY" ]] && NANOGPT_ERA=true
@@ -216,20 +260,17 @@ case "$PRESET" in
         MAX_POS=5; MAX_DAILY=15; MAX_TRADES=20 ;;
 esac
 
-# Per-position model defaults (overridable via AGENT_<NAME>_MODEL)
-SCOUT_MODEL_DEFAULT="anthropic/claude-sonnet-4-6"
-RISK_MODEL_DEFAULT="anthropic/claude-opus-4-6"
-JUDGE_MODEL_DEFAULT="anthropic/claude-opus-4-6"
-UTILITY_MODEL="${UTILITY_MODEL:-openai/gpt-5.4-mini}"
-
 pref() {  # nanogpt-era reference spelling for a model id
     if [[ "$NANOGPT_ERA" == "true" ]]; then echo "nanogpt/$1"; else echo "$1"; fi
 }
 
-echo "== setup-openclaw-triad v3.2 =="
+echo "== setup-openclaw-triad v3.3 =="
 echo "   roster : ${SCOUT} (scout) / ${RISK} (risk) / ${JUDGE} (judge)"
 echo "   preset : ${PRESET}   base: ${BASE_IMAGE}   openclaw: ${OPENCLAW_VERSION}"
 echo "   era    : nanogpt=${NANOGPT_ERA} telegram=${TELEGRAM_ON} tts=${ELEVEN_ON} docker=${DOCKER_ENABLE}"
+echo "   models : catalog=${#CATALOG[@]} entr(y|ies)"
+echo "            scout=${TRIAD_SCOUT_MODEL}  risk=${TRIAD_RISK_MODEL}"
+echo "            judge=${TRIAD_JUDGE_MODEL}  utility=${UTILITY_MODEL}"
 
 ###############################################################################
 # .ENV STEWARDSHIP (seed if absent, NEVER overwrite)
@@ -250,6 +291,16 @@ PERSONALITY_PRESET=${PRESET}
 # TELEGRAM_USER_ID=
 # ELEVENLABS_API_KEY=
 # ELEVENLABS_VOICE_ID=
+
+# --- Model lineup (env-driven; defaults are the Claude/GPT fallbacks) -------
+# Catalog: comma list; entry "vendor/model-id" or "vendor/model-id|Name".
+# Ids are BARE here (NanoGPT API audience). Example DeepSeek/GLM lineup:
+# NANOGPT_MODEL_CATALOG=deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3,z-ai/glm-5.3-flash-uncensored
+# TRIAD_SCOUT_MODEL=deepseek/deepseek-v4.1-flash-1017
+# TRIAD_RISK_MODEL=z-ai/glm-5.3
+# TRIAD_JUDGE_MODEL=z-ai/glm-5.3
+# UTILITY_MODEL=z-ai/glm-5.3-flash-uncensored
+# Per-agent overrides win over position defaults:
 # AGENT_$(up "$SCOUT")_MODEL=
 # AGENT_$(up "$RISK")_MODEL=
 # AGENT_$(up "$JUDGE")_MODEL=
@@ -380,22 +431,34 @@ fi
 #   - root accepts: gateway, models, agents. NOT swarm.
 #   - Telegram channel registration happens at runtime:
 #       openclaw channels add telegram
+#
+# Model spelling rules (two audiences):
+#   - catalog ids in providers.nanogpt.models: BARE (NanoGPT's API).
+#   - references (primary/utilityModel/fallbacks): nanogpt/-prefixed (router).
 ###############################################################################
+
+# Assemble catalog lines (comma-joined, no trailing comma — bash 3.2 safe).
+NL=$'\n'
+CATALOG_LINES=""
+for ENTRY in "${CATALOG[@]}"; do
+    [[ -n "$CATALOG_LINES" ]] && CATALOG_LINES="${CATALOG_LINES},${NL}"
+    CATALOG_LINES="${CATALOG_LINES}          { id: \"$(catalog_id "$ENTRY")\", name: \"$(catalog_name "$ENTRY")\" }"
+done
 
 MODELS_BLOCK=""
 if [[ "$NANOGPT_ERA" == "true" ]]; then
-    MODELS_BLOCK=$(cat << 'EOMB'
+    # Unquoted heredoc: ${CATALOG_LINES} expands now; \${NANOGPT_API_KEY}
+    # stays LITERAL for the runtime to interpolate from env at boot.
+    MODELS_BLOCK=$(cat << EOMB
   models: {
     mode: "merge",
     providers: {
       nanogpt: {
         baseUrl: "https://nano-gpt.com/api/v1",
-        apiKey: "${NANOGPT_API_KEY}",
+        apiKey: "\${NANOGPT_API_KEY}",
         api: "openai-completions",
         models: [
-          { id: "anthropic/claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-          { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6" },
-          { id: "openai/gpt-5.4-mini", name: "GPT-5.4 Mini" }
+${CATALOG_LINES}
         ]
       }
     }
@@ -405,15 +468,23 @@ EOMB
 fi
 
 AGENT_ENTRIES=""
+MODEL_MISMATCHES=0
 for AGENT in "${ROSTER[@]}"; do
     case "$AGENT" in
-        "$SCOUT") DEF_MODEL="$SCOUT_MODEL_DEFAULT" ;;
-        "$RISK")  DEF_MODEL="$RISK_MODEL_DEFAULT"  ;;
-        *)        DEF_MODEL="$JUDGE_MODEL_DEFAULT" ;;
+        "$SCOUT") DEF_MODEL="$TRIAD_SCOUT_MODEL" ;;
+        "$RISK")  DEF_MODEL="$TRIAD_RISK_MODEL"  ;;
+        *)        DEF_MODEL="$TRIAD_JUDGE_MODEL" ;;
     esac
     MODEL="$(agent_var "$AGENT" MODEL "$DEF_MODEL")"
     THINK="$(agent_var "$AGENT" THINKING medium)"
     VOICE="$(agent_var "$AGENT" VOICE "${ELEVENLABS_VOICE_ID:-default}")"
+
+    # Advisory: a referenced model missing from the catalog may be rejected
+    # at transport time. Loud now beats mysterious later.
+    if [[ "$NANOGPT_ERA" == "true" ]] && ! catalog_has "$MODEL"; then
+        echo "   [!] ADVISORY: ${AGENT} references '${MODEL}' — NOT in NANOGPT_MODEL_CATALOG. Add it or fix the ref."
+        MODEL_MISMATCHES=$((MODEL_MISMATCHES + 1))
+    fi
 
     TTS=""
     if [[ "$ELEVEN_ON" == "true" ]]; then
@@ -436,7 +507,7 @@ for AGENT in "${ROSTER[@]}"; do
           primary: \"$(pref "$MODEL")\",
           fallbacks: [\"$(pref "$UTILITY_MODEL")\"]
         },
-        utilityModel: \"$(pref "$UTILITY_MODEL")\",
+        utilityModel: \"$(pref "$UTILITY_MODEL\")\",
         thinkingDefault: \"${THINK}\",
         reasoningDefault: \"on\",
         sandbox: { mode: \"off\" }${TOOLS}${TTS}
@@ -444,8 +515,17 @@ for AGENT in "${ROSTER[@]}"; do
 done
 AGENT_ENTRIES="${AGENT_ENTRIES%,}"   # trim trailing comma (bash 3.2 param expansion)
 
+# Utility model must also be catalogued in the nanogpt era.
+if [[ "$NANOGPT_ERA" == "true" ]] && ! catalog_has "$UTILITY_MODEL"; then
+    echo "   [!] ADVISORY: UTILITY_MODEL '${UTILITY_MODEL}' — NOT in NANOGPT_MODEL_CATALOG. Add it or fix the ref."
+    MODEL_MISMATCHES=$((MODEL_MISMATCHES + 1))
+fi
+if [[ "$MODEL_MISMATCHES" -gt 0 ]]; then
+    echo "   [!] ${MODEL_MISMATCHES} model reference(s) missing from the catalog — the runtime may reject them at transport."
+fi
+
 cat << EOJSON > "${STATE_DIR}/openclaw.json"
-// Generated by setup-openclaw-triad.sh (v3.2)
+// Generated by setup-openclaw-triad.sh (v3.3)
 {
   gateway: { mode: "local" },
 ${MODELS_BLOCK}
@@ -456,7 +536,7 @@ ${MODELS_BLOCK}
       workspace: "${CONTAINER_WORKSPACE_ROOT}",
       cwd: "${CONTAINER_WORKSPACE_ROOT}",
       model: {
-        primary: "$(pref "$SCOUT_MODEL_DEFAULT")",
+        primary: "$(pref "$TRIAD_SCOUT_MODEL")",
         fallbacks: ["$(pref "$UTILITY_MODEL")"]
       },
       utilityModel: "$(pref "$UTILITY_MODEL")",
@@ -469,7 +549,7 @@ ${AGENT_ENTRIES}
 }
 EOJSON
 
-echo "   [ok] openclaw.json written (schema-valid: ownership explicit, no theme/role/bindings/swarm, systemAgent=${SCOUT})"
+echo "   [ok] openclaw.json written (schema-valid; ownership explicit; systemAgent=${SCOUT})"
 
 ###############################################################################
 # TELEGRAM PLUGIN (legacy fallback front-end; primary path is the runtime
@@ -569,7 +649,7 @@ if [[ "$DOCKER_ENABLE" == "true" ]]; then
 
     # --- docker.env (interpolation vars; NO secrets — committable) ----------
     cat << EODE > "${STATE_DIR}/docker.env"
-# Generated by setup-openclaw-triad.sh (v3.2) — interpolation only, no secrets.
+# Generated by setup-openclaw-triad.sh (v3.3) — interpolation only, no secrets.
 COMPOSE_PROJECT_NAME=openclaw-triad
 
 # ---- Host paths (derived from OPENCLAW_STATE_DIR) ----
@@ -596,7 +676,7 @@ EODE
     # All ${VARS} below are Docker build args / env resolved by docker itself.
     cat << 'EODF' > "${STATE_DIR}/Dockerfile"
 # syntax=docker/dockerfile:1
-# Generated by setup-openclaw-triad.sh (v3.2)
+# Generated by setup-openclaw-triad.sh (v3.3)
 
 ARG BASE_IMAGE=node:24-slim
 
@@ -651,7 +731,7 @@ EODF
     # --- docker-compose.yml ----------------------------------------------------
     # ${VARS} below are interpolated by docker compose from docker.env.
     cat << 'EOCC' > "${STATE_DIR}/docker-compose.yml"
-# Generated by setup-openclaw-triad.sh (v3.2)
+# Generated by setup-openclaw-triad.sh (v3.3)
 services:
   openclaw-triad:
     image: openclaw-triad:local
@@ -721,12 +801,14 @@ cat << EOSUM
   State dir : ${STATE_DIR}
   Roster    : ${SCOUT} (scout) / ${RISK} (risk) / ${JUDGE} (judge)
   Preset    : ${PRESET} — limits: ${MAX_POS}% pos / ${MAX_DAILY}% daily / ${MAX_TRADES} trades
+  Models    : scout=$(pref "$TRIAD_SCOUT_MODEL")  risk=$(pref "$TRIAD_RISK_MODEL")
+              judge=$(pref "$TRIAD_JUDGE_MODEL")  utility=$(pref "$UTILITY_MODEL")
 EOSUM
 if [[ "$DOCKER_ENABLE" == "true" ]]; then
-    echo "  1. Review ${ENV_FILE} (secrets, keys)"
+    echo "  1. Review ${ENV_FILE} (secrets, keys, model lineup)"
     echo "  2. make docker-build && make docker-up"
 else
-    echo "  1. Review ${ENV_FILE} (secrets, keys)"
+    echo "  1. Review ${ENV_FILE} (secrets, keys, model lineup)"
     echo "  2. run with --docker / DOCKER_ENABLE=true for the container stack"
 fi
 echo "  3. make logs — expect [gateway] ready and your roster names registering"
