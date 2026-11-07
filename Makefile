@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 #
-# Makefile for OpenClaw Triad Orchestration (v2 — .env-aware)
+# Makefile for OpenClaw Triad Orchestration (v3 — secrets-stash aware)
 # Place this in ~/openclaw-orchestrate/Makefile
 #
-# KEY CHANGE vs v1: the setup target SOURCES your state-dir .env before
-# invoking the generator, so every variable in it — AGENT_ROSTER,
-# PERSONALITY_PRESET, AGENT_{NAME}_*, API keys — reaches the script.
-# No more hand-enumerated variable lists silently dropping new knobs.
+# KEY CHANGE vs v2: a persistent secrets stash OUTSIDE the state dir.
+#   env/.env.real-secrets  — your actual API keys, lives here forever.
+#   env/.env.example       — shape-only template (no real keys), safe to commit.
+# 'make init' now seeds in priority order: stash first, example second.
+# 'make secrets-save' snapshots the live .env into the stash.
+# 'make secrets-restore' pushes the stash back into the state dir.
+#
+# IMPORTANT: the rebuild script overwrites this Makefile from the pinned
+# tag on every run — commit + tag any change here (Layer 3), or the
+# fetch silently reverts it.
 #
 # USAGE:
-#   make init            # Create dirs, seed .env from template
+#   make init            # Create dirs, seed .env (stash > example)
+#   make secrets-save    # Snapshot live .env -> env/.env.real-secrets
+#   make secrets-restore # Push stash -> live .env (no questions asked)
 #   make setup           # Regenerate the stack using .env values
 #   make docker-build    # Build the container image
 #   make docker-up       # Start the Gateway
@@ -25,7 +33,7 @@
 #
 
 SHELL := /bin/bash
-.PHONY: init setup docker-build docker-up docker-down clean wipe logs logs-system shell status agents help
+.PHONY: init secrets-save secrets-restore setup docker-build docker-up docker-down clean wipe logs logs-system shell status agents help
 
 # =============================================================================
 # CONFIGURATION (override via environment or .env file)
@@ -38,6 +46,12 @@ COMPOSE_FILE ?= $(OPENCLAW_STATE_DIR)/docker-compose.yml
 COMPOSE_ENV ?= $(OPENCLAW_STATE_DIR)/docker.env
 ENV_FILE ?= $(OPENCLAW_STATE_DIR)/.env
 
+# Secrets lifecycle: stash survives `rm -rf ~/.openclaw` AND survives the
+# rebuild's pinned-tag fetch (only Makefile + scripts/* are fetched).
+ENV_DIR ?= $(ORCHESTRATE_DIR)/env
+SECRETS_STASH ?= $(ENV_DIR)/.env.real-secrets
+SECRETS_EXAMPLE ?= $(ENV_DIR)/.env.example
+
 DOCKER_ENABLE ?= true
 
 # =============================================================================
@@ -46,25 +60,48 @@ DOCKER_ENABLE ?= true
 
 init:
 	@echo "🚀 Initializing OpenClaw orchestration..."
-	@mkdir -p $(ORCHESTRATE_DIR)/scripts $(ORCHESTRATE_DIR)/env
+	@mkdir -p $(ORCHESTRATE_DIR)/scripts $(ENV_DIR)
 	@mkdir -p $(OPENCLAW_STATE_DIR)
 	@if [ ! -f "$(ORCHESTRATE_DIR)/scripts/setup-openclaw-triad.sh" ]; then \
 		echo "   ⚠  Setup script missing — place setup-openclaw-triad.sh in scripts/"; \
 	else \
 		echo "   ✓ Setup script present"; \
 	fi
-	@if [ ! -f "$(ENV_FILE)" ]; then \
-		if [ -f "$(ORCHESTRATE_DIR)/env/.env.example" ]; then \
-			cp $(ORCHESTRATE_DIR)/env/.env.example $(ENV_FILE); \
-			echo "   ✓ Seeded $(ENV_FILE) from template"; \
-		else \
-			echo "   ⚠  No .env.example in env/ — run 'make setup' to generate one"; \
-		fi \
-	else \
+	@if [ -f "$(ENV_FILE)" ]; then \
 		echo "   ✓ .env already present (preserved)"; \
+	elif [ -f "$(SECRETS_STASH)" ]; then \
+		cp $(SECRETS_STASH) $(ENV_FILE); \
+		chmod 600 $(ENV_FILE); \
+		echo "   ✓ Seeded $(ENV_FILE) from real-secrets STASH"; \
+		echo "   ⚠  Never a bad moment: 'make secrets-save' to refresh the stash"; \
+	elif [ -f "$(SECRETS_EXAMPLE)" ]; then \
+		cp $(SECRETS_EXAMPLE) $(ENV_FILE); \
+		chmod 600 $(ENV_FILE); \
+		echo "   ✓ Seeded $(ENV_FILE) from EXAMPLE template"; \
+		echo "   ⚠  Keys are placeholders — fill in NANOGPT_API_KEY now"; \
+	else \
+		echo "   ⚠  No stash and no example — 'make setup' will seed a skeleton .env"; \
 	fi
 	@chmod 600 $(ENV_FILE) 2>/dev/null || true
 	@echo "✓ Init complete. Edit $(ENV_FILE) then run 'make setup'"
+
+# =============================================================================
+# SECRETS STASH — survive state-dir wipes and rebuilds
+# =============================================================================
+
+secrets-save:
+	@test -f "$(ENV_FILE)" || { echo "❌ No live .env to snapshot ($(ENV_FILE))"; exit 1; }
+	@mkdir -p $(ENV_DIR)
+	@cp $(ENV_FILE) $(SECRETS_STASH)
+	@chmod 600 $(SECRETS_STASH)
+	@echo "🔐 Stashed live secrets -> $(SECRETS_STASH) ($(shell wc -c < $(ENV_FILE) | tr -d ' ') bytes)"
+
+secrets-restore:
+	@test -f "$(SECRETS_STASH)" || { echo "❌ No stash at $(SECRETS_STASH) — nothing to restore"; exit 1; }
+	@mkdir -p $(OPENCLAW_STATE_DIR)
+	@cp $(SECRETS_STASH) $(ENV_FILE)
+	@chmod 600 $(ENV_FILE)
+	@echo "🔓 Restored stash -> $(ENV_FILE)"
 
 # =============================================================================
 # SETUP — sources .env so ALL variables (roster, preset, keys) reach the script
@@ -120,10 +157,11 @@ clean:
 
 wipe:
 	@echo "☣️  DANGER: This will remove ALL OpenClaw state — journals, ledgers, calibration!"
+	@echo "    Your secrets stash ($(SECRETS_STASH)) survives, but live agent data does not."
 	@read -p "Type 'WIPE' to confirm: " CONFIRM && \
 		[ "$$CONFIRM" = "WIPE" ] || { echo "Aborted"; exit 1; }
 	rm -rf $(OPENCLAW_STATE_DIR)
-	@echo "✓ Complete wipe done. Run 'make init' to start fresh"
+	@echo "✓ Complete wipe done. Run 'make init' then 'make secrets-restore' for a from-scratch boot"
 
 # =============================================================================
 # MONITORING & DEBUGGING
@@ -154,8 +192,11 @@ status:
 	@echo "📁 State directory: $(OPENCLAW_STATE_DIR)"
 	@test -f "$(OPENCLAW_STATE_DIR)/openclaw.json" && \
 		echo "   Config: present" || echo "   Config: MISSING"
-	@test -f "$(ENV_FILE)" && \
-		echo "   Secrets: present ($(ENV_FILE))" || echo "   Secrets: MISSING"
+	@test -f "$(ENV_FILE) && echo "   Secrets: present ($(ENV_FILE))" || \
+		echo "   Secrets: MISSING (try 'make secrets-restore')"
+	@test -f "$(SECRETS_STASH)" && \
+		echo "   Stash:   present ($(SECRETS_STASH))" || \
+		echo "   Stash:   not yet saved (run 'make secrets-save')"
 	@test -d "$(OPENCLAW_STATE_DIR)/agents" && \
 		echo "   Agent dirs: $$(ls -1 $(OPENCLAW_STATE_DIR)/agents 2>/dev/null | tr '\n' ' ')" || \
 		echo "   Agents: not initialized"
@@ -171,24 +212,28 @@ help:
 	@echo "============================"
 	@echo ""
 	@echo "Commands:"
-	@echo "  make init         Initialize dirs and seed .env from template"
-	@echo "  make setup        Regenerate the stack using .env values"
-	@echo "  make docker-build Build the container image"
-	@echo "  make docker-up    Start the gateway"
-	@echo "  make docker-down  Stop containers"
-	@echo "  make clean        Remove containers + image (state preserved)"
-	@echo "  make wipe         DANGER: remove ALL state (confirm required)"
-	@echo "  make logs         Follow gateway logs"
-	@echo "  make logs-system  Last 100 lines of logs"
-	@echo "  make shell        Shell into the container"
-	@echo "  make agents       Show configured roster and preset"
-	@echo "  make status       Deployment and state health"
+	@echo "  make init            Initialize dirs, seed .env (stash > example)"
+	@echo "  make secrets-save    Snapshot live .env -> env/.env.real-secrets"
+	@echo "  make secrets-restore Restore stash -> live .env"
+	@echo "  make setup           Regenerate the stack using .env values"
+	@echo "  make docker-build    Build the container image"
+	@echo "  make docker-up        Start the gateway"
+	@echo "  make docker-down      Stop containers"
+	@echo "  make clean           Remove containers + image (state preserved)"
+	@echo "  make wipe            DANGER: remove ALL state (confirm required)"
+	@echo "  make logs            Follow gateway logs"
+	@echo "  make logs-system     Last 100 lines of logs"
+	@echo "  make shell           Shell into the container"
+	@echo "  make agents          Show configured roster and preset"
+	@echo "  make status          Deployment and state health (incl. stash)"
 	@echo ""
-	@echo "Workflow:"
-	@echo "  1. make init"
-	@echo "  2. Edit $(ENV_FILE):"
+	@echo "From-scratch bootstrap:"
+	@echo "  1. make init                  # seeds .env from stash if present"
+	@echo "  2. make secrets-restore       # if .env keys look stale"
+	@echo "  3. Edit $(ENV_FILE):"
 	@echo "       NANOGPT_API_KEY, OPENCLAW_GATEWAY_TOKEN,"
 	@echo "       AGENT_ROSTER, PERSONALITY_PRESET"
-	@echo "  3. make setup"
-	@echo "  4. make docker-build && make docker-up"
+	@echo "  4. make secrets-save          # persist your keys for next wipe"
+	@echo "  5. make setup"
+	@echo "  6. make docker-build && make docker-up"
 	@echo ""
