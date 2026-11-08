@@ -1,7 +1,10 @@
 # CI for openclaw-orchestrate — smoke tests with proper env seeding
 #
+# NOTE: reconstruction matching the job names of run 42454827675.
+# Diff against your existing .github/workflows/ci.yml before replacing.
+#
 # Root-cause fixes applied:
-#   1. "Makefile sanity" fails if ~/.openclaw/.env is absent: `make setup`
+#   1. "Makefile sanity" fails if the state-dir .env is absent: `make setup`
 #      hard-exits when ENV_FILE is missing, and `make init` only seeds it
 #      when env/.env.example exists in the repo. We seed a dummy .env in
 #      the workflow instead (placeholder values only — never real keys).
@@ -10,6 +13,9 @@
 #      unset-but-required variable.
 #   3. Post-generation assertions so a silent 0-exit doesn't hide a
 #      broken generation.
+#
+# GH limitation: the `runner` context is NOT valid in job-level `env:` —
+# state dirs therefore derive from `github.workspace` instead of `runner.temp`.
 
 name: CI
 
@@ -31,7 +37,7 @@ jobs:
     name: Makefile sanity (init + setup, no keys)
     runs-on: ubuntu-latest
     env:
-      OPENCLAW_STATE_DIR: ${{ runner.temp }}/openclaw-state
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/make-sanity
       # Placeholder secrets — presence is all the generator checks.
       NANOGPT_API_KEY: ci-placeholder-key
       OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
@@ -81,7 +87,7 @@ jobs:
       matrix:
         preset: [default, mystic, bold, conservative, quant]
     env:
-      OPENCLAW_STATE_DIR: ${{ runner.temp }}/triad-${{ matrix.preset }}
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/preset-${{ matrix.preset }}
       PERSONALITY_PRESET: ${{ matrix.preset }}
       NANOGPT_API_KEY: ci-placeholder-key
       OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
@@ -115,7 +121,7 @@ jobs:
     name: Env-driven model lineup (v3.3)
     runs-on: ubuntu-latest
     env:
-      OPENCLAW_STATE_DIR: ${{ runner.temp }}/triad-lineup
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/model-lineup
       NANOGPT_API_KEY: ci-placeholder-key
       OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
       AGENT_ROSTER: seer,guardian,sage
@@ -165,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [validate-make, model-lineup]
     env:
-      OPENCLAW_STATE_DIR: ${{ runner.temp }}/triad-docker
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/docker-build
       NANOGPT_API_KEY: ci-placeholder-key
       OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
       AGENT_ROSTER: seer,guardian,sage
