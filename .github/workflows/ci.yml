@@ -13,6 +13,9 @@
 #      unset-but-required variable.
 #   3. Post-generation assertions so a silent 0-exit doesn't hide a
 #      broken generation.
+#   4. Compose validation passes the GENERATED docker.env via --env-file;
+#      the compose file interpolates APP_UID/CONTAINER_* from it and fails
+#      type-casting when they resolve blank.
 #
 # GH quirks:
 #   - The `runner` context is NOT valid in job-level `env:` — state dirs
@@ -115,7 +118,9 @@ jobs:
           grep -Eq '"maxTradesPerDay": [0-9]+' "$OPENCLAW_STATE_DIR/shared/trading.json"
 
       - name: Generated compose file parses
-        run: docker compose -f "$OPENCLAW_STATE_DIR/docker-compose.yml" config -q
+        run: >-
+          docker compose --env-file "$OPENCLAW_STATE_DIR/docker.env"
+          -f "$OPENCLAW_STATE_DIR/docker-compose.yml" config -q
 
   # ---------------------------------------------------------------------
   # v3.3 env-driven model lineup: catalog + seat defaults + overrides.
