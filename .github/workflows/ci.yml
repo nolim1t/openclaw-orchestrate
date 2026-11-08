@@ -1,0 +1,323 @@
+# GitHub Actions CI for OpenClaw Triad
+#
+# File: .github/workflows/ci.yml
+# Runs on every push to main and on all pull requests.
+#
+# Assertions are aligned with setup-openclaw-triad.sh v3.3:
+#   - schema-valid config: ownership "explicit", NO theme/role keys,
+#     judge read-only (read + message tools), sandbox mode off
+#   - nanogpt wiring: bare catalog ids, nanogpt/-prefixed references
+#   - env-driven model lineup (NANOGPT_MODEL_CATALOG, TRIAD_*_MODEL, utility)
+#     plus the missing-catalog ADVISORY (loud, non-fatal)
+#   - testnet-by-default trading.json and wallet posture (zero auto-withdrawal)
+#   - docker.env: no secrets, BASE_IMAGE=node:24-slim, CONTAINER_MEM_LIMIT=3g
+#   - compose: read_only, cap_drop ALL, healthcheck, private .tmp tmpfs
+#
+# Jobs:
+#   lint-shell      — bash -n + shellcheck on all shell scripts (strict)
+#   validate-make   — Makefile pipeline: init → seeded .env → setup → assertions
+#   smoke-generate  — preset matrix; asserts v3.3 invariants + roster validation
+#   model-lineup    — custom catalog / seat overrides / advisory behaviour
+#   smoke-docker    — builds + briefly boots the generated image (ubuntu only)
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-shell:
+    name: Lint shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Syntax check (bash -n)
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in $(git ls-files '*.sh'); do
+            echo "::group::$f"
+            if ! bash -n "$f"; then
+              echo "::error file=$f::failed bash -n syntax check"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: Shellcheck (strict)
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in $(git ls-files '*.sh'); do
+            echo "::group::$f"
+            # SC2317: unreachable-code heuristics miss dynamically-invoked funcs
+            if ! shellcheck --severity=style -e SC2317 "$f"; then
+              echo "::error file=$f::shellcheck reported issues"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  validate-make:
+    name: Makefile sanity (init + setup, no keys)
+    runs-on: ubuntu-latest
+    env:
+      OPENCLAW_STATE_DIR: /tmp/.openclaw-ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make init (seed .env)
+        run: make init
+
+      - name: Seed minimal .env (gateway token only, no API keys)
+        run: |
+          # Simulate a user who set the one required secret but has no
+          # model/telegram/tts keys — generator must handle a bare roster.
+          {
+            echo "OPENCLAW_GATEWAY_TOKEN=ci-placeholder-token"
+            echo "AGENT_ROSTER=seer,guardian,sage"
+            echo "PERSONALITY_PRESET=default"
+          } >> "${OPENCLAW_STATE_DIR}/.env"
+
+      - name: make setup
+        run: make setup
+
+      - name: Assert generated stack
+        run: |
+          set -euo pipefail
+          S="${OPENCLAW_STATE_DIR}"
+          [ -f "$S/openclaw.json" ]
+          [ -d "$S/agents/seer" ] && [ -d "$S/agents/guardian" ] && [ -d "$S/agents/sage" ]
+          [ -f "$S/workspace-triad/seer/AGENTS.md" ]
+          [ -f "$S/shared/trading.json" ]
+          [ -f "$S/Dockerfile" ]
+          [ -f "$S/docker-compose.yml" ]
+          [ -f "$S/docker.env" ]
+          [ -f "$S/.gitignore" ]
+
+      - name: Assert testnet defaults
+        run: |
+          set -euo pipefail
+          grep -q '"mode": "testnet"' "${OPENCLAW_STATE_DIR}/shared/trading.json"
+          grep -q '"minRiskReward": 2.0' "${OPENCLAW_STATE_DIR}/shared/trading.json"
+
+      - name: make help
+        run: make help
+
+      - name: make agents
+        run: make agents
+
+  smoke-generate:
+    name: Generator smoke (preset ${{ matrix.preset }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [default, mystic, bold, conservative, quant]
+    env:
+      OPENCLAW_STATE_DIR: /tmp/.openclaw-smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate with preset ${{ matrix.preset }} (nanogpt + telegram + docker)
+        run: |
+          set -euo pipefail
+          export AGENT_ROSTER="seer,guardian,sage"
+          export PERSONALITY_PRESET="${{ matrix.preset }}"
+          export OPENCLAW_GATEWAY_TOKEN=ci-placeholder-token
+          export NANOGPT_API_KEY=ci-placeholder-nanogpt-key
+          export TELEGRAM_BOT_TOKEN=ci-placeholder-telegram-token
+          export TELEGRAM_USER_ID=123456789
+          export DOCKER_ENABLE=true
+          ./scripts/setup-openclaw-triad.sh --non-interactive
+
+      - name: Assert v3.3 config invariants
+        run: |
+          set -euo pipefail
+          S="${OPENCLAW_STATE_DIR}"
+          cfg="$S/openclaw.json"
+
+          # -- nanogpt wiring --
+          grep -q 'providers: {' "$cfg"                        # provider block present
+          ! grep -q 'id: "nanogpt/' "$cfg"                     # catalog ids stay BARE
+          grep -q 'primary: "nanogpt/anthropic/claude-sonnet-4-6"' "$cfg"  # refs prefixed
+          grep -q 'baseUrl: "https://nano-gpt.com/api/v1"' "$cfg"
+
+          # -- schema-valid posture (v3.2) --
+          grep -q 'ownership: "explicit"' "$cfg"               # multi-agent ownership
+          ! grep -qi 'theme' "$cfg"                            # NO theme/role keys in config
+          ! grep -q 'bindings' "$cfg"                          # NO bindings array
+          ! grep -q 'swarm' "$cfg"                             # NO root swarm key
+          grep -q 'systemAgent: { agentId: "seer" }' "$cfg"    # TUI lands on OUR agent
+
+          # -- sandbox: off (the container IS the sandbox) --
+          grep -q 'mode: "off"' "$cfg"
+          ! grep -q 'mode: "all"' "$cfg"
+
+          # -- least privilege: judge is read-only --
+          grep -q 'tools: { allow: ["read", "message"] }' "$cfg"
+
+          # -- personas live in AGENTS.md, not config --
+          grep -q "Seer — " "$S/workspace-triad/seer/AGENTS.md"
+
+          # -- testnet-first posture --
+          grep -q '"mode": "testnet"' "$S/shared/trading.json"
+
+          # -- state-dir hygiene --
+          grep -qx '.env' "$S/.gitignore"
+
+      - name: Assert Docker posture (v3.3 emission)
+        run: |
+          set -euo pipefail
+          S="${OPENCLAW_STATE_DIR}"
+
+          # docker.env: interpolation only, committable
+          grep -q 'BASE_IMAGE=node:24-slim' "$S/docker.env"
+          grep -q 'CONTAINER_MEM_LIMIT=3g' "$S/docker.env"
+          ! grep -Eq '(ci-placeholder|api.?key=)' "$S/docker.env"
+
+          # compose: hardening + interpolated ceilings
+          grep -q 'mem_limit: ${CONTAINER_MEM_LIMIT}' "$S/docker-compose.yml"
+          grep -q 'read_only: true' "$S/docker-compose.yml"
+          grep -q 'cap_drop:' "$S/docker-compose.yml"
+          grep -q 'no-new-privileges:true' "$S/docker-compose.yml"
+          grep -q 'healthcheck:' "$S/docker-compose.yml"
+          grep -q '/home/openclaw/.tmp' "$S/docker-compose.yml"
+
+          # Dockerfile: image-side config guard + non-root user
+          grep -q 'rm -rf "${CONTAINER_STATE_DIR}/openclaw.json"' "$S/Dockerfile"
+          grep -q 'USER openclaw' "$S/Dockerfile"
+
+      - name: Reject wrong roster shapes
+        run: |
+          set -uo pipefail
+          export OPENCLAW_STATE_DIR=/tmp/.openclaw-smoke-bad
+          export OPENCLAW_GATEWAY_TOKEN=x
+          # 2 agents -> must fail
+          if AGENT_ROSTER="alpha,beta" ./scripts/setup-openclaw-triad.sh --non-interactive 2>/dev/null; then
+            echo "ERROR: 2-agent roster should have failed"; exit 1
+          fi
+          # 4 agents -> must fail
+          if AGENT_ROSTER="a,b,c,d" ./scripts/setup-openclaw-triad.sh --non-interactive 2>/dev/null; then
+            echo "ERROR: 4-agent roster should have failed"; exit 1
+          fi
+          echo "OK: roster validation behaves"
+
+  model-lineup:
+    name: Env-driven model lineup (v3.3)
+    runs-on: ubuntu-latest
+    env:
+      OPENCLAW_STATE_DIR: /tmp/.openclaw-lineup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Custom catalog + seat overrides honoured
+        run: |
+          set -euo pipefail
+          export AGENT_ROSTER="seer,guardian,sage"
+          export PERSONALITY_PRESET=quant
+          export OPENCLAW_GATEWAY_TOKEN=ci-placeholder-token
+          export NANOGPT_API_KEY=ci-placeholder-nanogpt-key
+          export NANOGPT_MODEL_CATALOG="deepseek/deepseek-v4.1-flash-1017|DeepSeek Flash,z-ai/glm-5.3|GLM 5.3"
+          export TRIAD_SCOUT_MODEL="z-ai/glm-5.3"
+          export TRIAD_RISK_MODEL="deepseek/deepseek-v4.1-flash-1017"
+          export TRIAD_JUDGE_MODEL="z-ai/glm-5.3"
+          export UTILITY_MODEL="deepseek/deepseek-v4.1-flash-1017"
+          ./scripts/setup-openclaw-triad.sh --non-interactive
+
+          cfg="${OPENCLAW_STATE_DIR}/openclaw.json"
+          # catalog entries emitted with display names, ids BARE
+          grep -q 'id: "deepseek/deepseek-v4.1-flash-1017", name: "DeepSeek Flash"' "$cfg"
+          grep -q 'id: "z-ai/glm-5.3", name: "GLM 5.3"' "$cfg"
+          # seat defaults applied, refs nanogpt/-prefixed
+          grep -q 'primary: "nanogpt/z-ai/glm-5.3"' "$cfg"
+          # utility model respected
+          grep -q 'utilityModel: "nanogpt/deepseek/deepseek-v4.1-flash-1017"' "$cfg"
+
+      - name: Missing-catalog model fires ADVISORY (loud, non-fatal)
+        run: |
+          set -euo pipefail
+          export OPENCLAW_STATE_DIR=/tmp/.openclaw-lineup-advise
+          export AGENT_ROSTER="seer,guardian,sage"
+          export OPENCLAW_GATEWAY_TOKEN=ci-placeholder-token
+          export NANOGPT_API_KEY=ci-placeholder-nanogpt-key
+          export NANOGPT_MODEL_CATALOG="z-ai/glm-5.3"
+          export TRIAD_SCOUT_MODEL="totally/fake-model-9"
+
+          out="$(./scripts/setup-openclaw-triad.sh --non-interactive 2>&1)" \
+            || { echo "ERROR: advisory should be non-fatal"; exit 1; }
+          echo "$out" | grep -q 'ADVISORY'      # must warn loudly...
+          echo "$out" | grep -q 'fake-model-9'  # ...about the right model
+
+          # reference still wired (runtime is the final judge, generation proceeds)
+          grep -q 'primary: "nanogpt/totally/fake-model-9"' \
+            "${OPENCLAW_STATE_DIR}/openclaw.json"
+
+      - name: Bad catalog fails fast
+        run: |
+          set -uo pipefail
+          export OPENCLAW_STATE_DIR=/tmp/.openclaw-lineup-bad
+          export AGENT_ROSTER="seer,guardian,sage"
+          export OPENCLAW_GATEWAY_TOKEN=x
+          export NANOGPT_API_KEY=k
+          # catalog of only separators/whitespace -> must fail
+          if NANOGPT_MODEL_CATALOG=" , , " ./scripts/setup-openclaw-triad.sh --non-interactive 2>/dev/null; then
+            echo "ERROR: empty catalog should have failed"; exit 1
+          fi
+          echo "OK: catalog validation behaves"
+
+  smoke-docker:
+    name: Docker build (generated image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OPENCLAW_STATE_DIR: /tmp/.openclaw-docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate stack (docker mode)
+        run: |
+          set -euo pipefail
+          export AGENT_ROSTER="seer,guardian,sage"
+          export PERSONALITY_PRESET=default
+          export OPENCLAW_GATEWAY_TOKEN=ci-placeholder-token
+          export DOCKER_ENABLE=true
+          ./scripts/setup-openclaw-triad.sh --non-interactive
+
+      - name: Build image via compose
+        run: |
+          set -euo pipefail
+          cd "${OPENCLAW_STATE_DIR}"
+          docker compose --env-file docker.env build --pull
+
+      - name: Bring gateway up briefly
+        run: |
+          set -euo pipefail
+          cd "${OPENCLAW_STATE_DIR}"
+          docker compose --env-file docker.env up -d
+          sleep 20
+          # container running & not restart-looping
+          state="$(docker compose --env-file docker.env ps --format json | head -1)"
+          echo "$state" | grep -Eq '"State":"running"'
+          docker compose --env-file docker.env logs --tail=50 || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          cd "${OPENCLAW_STATE_DIR}" && docker compose --env-file docker.env down -v || true

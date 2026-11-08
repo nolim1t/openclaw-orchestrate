@@ -1,0 +1,144 @@
+# =============================================================================
+# .gitignore — OpenClaw Triad Orchestrator
+#
+# Place in ~/openclaw-orchestrate/.gitignore
+#
+# SECURITY POSTURE:
+#   Layer 1 — Ignore secrets outright (.env, keys, wallets)
+#   Layer 2 — Ignore anything that MIGHT contain secrets (generated config)
+#   Layer 3 — Whitelist explicitly (git cannot track ignored parents' children)
+#
+# RULE OF THUMB: if a file could cost you money if leaked, it goes here
+# BEFORE it ever exists. Assume future-you creates files you didn't predict.
+# =============================================================================
+
+# =============================================================================
+# LAYER 1 — SECRETS. ABSOLUTE, UNDER ALL CIRCUMSTANCES.
+# =============================================================================
+
+# Environment files (API keys, wallet private keys, bot tokens)
+.env
+.env.*
+!.env.example
+!env/
+
+# Legacy / editor-local variants
+.env.local
+.env.production
+.env.backup
+env/.env
+env/.env.*
+
+# Private keys — any format, anywhere
+*.key
+*.pem
+*.p12
+*.pfx
+*.p8
+id_rsa
+id_ed25519
+id_ecdsa
+*.seed
+*seed-phrase*
+*mnemonic*
+
+# Wallet material
+wallet-*
+*wallet.dat
+keystore/
+keystore.json
+
+# NanoGPT / Polymarket / provider credentials in any loose file
+*nanogpt*
+!*nanogpt*.md
+*polymarket-creds*
+*api-keys*
+
+# =============================================================================
+# LAYER 2 — GENERATED STATE. LIVES IN ~/.openclaw/, NEVER HERE.
+# Defense against accidentally copying the state dir into the repo.
+# =============================================================================
+
+# Runtime state trees
+agents/
+workspace-triad/
+shared/
+logs/
+plugins/
+helpers/
+
+# Generated config (contains resolved absolute paths; keep it out of git
+# review cycles — regenerate with `make setup` instead)
+openclaw.json
+docker-compose.yml
+Dockerfile
+docker.env
+requirements.txt
+.dockerignore
+
+# =============================================================================
+# LAYER 3 — TEST SANDBOXES. THROWAWAY BY DESIGN.
+# =============================================================================
+
+# `make test` sandboxes
+/tmp/openclaw-test-*
+openclaw-test-*
+*-openclaw-test/
+.sandbox/
+sandbox/
+
+# =============================================================================
+# GIT-TRACKED: ALLOWED EXPLICITLY
+# =============================================================================
+# These SHOULD be committed — they are the portable recipe:
+#   Makefile
+#   README.md
+#   scripts/setup-openclaw-triad.sh
+#   env/.env.example          ← template only, never filled values
+#
+# Uncomment the block below ONLY if you want git to force-include something
+# that a parent pattern may have caught. Use with extreme care.
+# =============================================================================
+# !scripts/**
+# !env/.env.example
+
+# =============================================================================
+# GENERAL HYGIENE
+# =============================================================================
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor swap / backup files (often contain unsaved .env edits!)
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.tmp
+
+# VS Code / JetBrains local state
+.vscode/
+.idea/
+*.iml
+
+# Python artifacts (plugin dev)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Tarballs & backups (frequently contain state-dir snapshots)
+*.tar.gz
+*.tgz
+*.zip
+backup/
+backups/
+
+# Docker local overrides (may contain env_file paths or registry creds)
+docker-compose.override.yml
+docker.env.local
