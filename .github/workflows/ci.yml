@@ -135,7 +135,7 @@ jobs:
       AGENT_ROSTER: seer,guardian,sage
       PERSONALITY_PRESET: quant
       NANOGPT_MODEL_CATALOG: >-
-        deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3|GLM 5.3,z-ai/glm-5.3-flash-uncensored
+        deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3|GLM 5.3,z-ai/glm-5.3-flash-uncensored,Gemma-4-31B-Gembrain-X-Core,x-ai/grok-4.7
       TRIAD_SCOUT_MODEL: deepseek/deepseek-v4.1-flash-1017
       TRIAD_RISK_MODEL: z-ai/glm-5.3
       TRIAD_JUDGE_MODEL: z-ai/glm-5.3
