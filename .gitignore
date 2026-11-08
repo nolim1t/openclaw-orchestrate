@@ -16,6 +16,9 @@
 # LAYER 1 — SECRETS. ABSOLUTE, UNDER ALL CIRCUMSTANCES.
 # =============================================================================
 
+# Don't commit proton-drive binary
+proton-drive
+
 # Environment files (API keys, wallet private keys, bot tokens)
 .env
 .env.*
