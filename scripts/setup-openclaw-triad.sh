@@ -179,7 +179,7 @@ MODELS_ENTRIES=""
 MODEL_CATALOG_IDS=""
 IFS=',' read -ra _mc <<< "$MODEL_CATALOG_RAW"
 for _m in "${_mc[@]}"; do
-    _m="$(echo "$_m" | tr -d '[:space:]')"
+    _m="$(printf '%s' "$_m" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [[ -z "$_m" ]] && continue
     _id="$_m"; _name=""
     case "$_m" in
