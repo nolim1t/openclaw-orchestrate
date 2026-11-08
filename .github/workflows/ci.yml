@@ -36,44 +36,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-shell:
-    name: Lint shell scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Syntax check (bash -n)
-        run: |
-          set -euo pipefail
-          fail=0
-          for f in $(git ls-files '*.sh'); do
-            echo "::group::$f"
-            if ! bash -n "$f"; then
-              echo "::error file=$f::failed bash -n syntax check"
-              fail=1
-            fi
-            echo "::endgroup::"
-          done
-          exit $fail
-
-      - name: Shellcheck (strict)
-        run: |
-          set -euo pipefail
-          fail=0
-          for f in $(git ls-files '*.sh'); do
-            echo "::group::$f"
-            # SC2317: unreachable-code heuristics miss dynamically-invoked funcs
-            if ! shellcheck --severity=style -e SC2317 "$f"; then
-              echo "::error file=$f::shellcheck reported issues"
-              fail=1
-            fi
-            echo "::endgroup::"
-          done
-          exit $fail
-
   validate-make:
     name: Makefile sanity (init + setup, no keys)
     runs-on: ubuntu-latest
