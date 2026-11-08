@@ -1,3 +1,5 @@
+![Banner](/docs/banner.png)
+
 # OpenClaw Triad 🐾
 
 [![CI](https://github.com/nolim1t/openclaw-orchestrate/actions/workflows/ci.yml/badge.svg)](https://github.com/nolim1t/openclaw-orchestrate/actions/workflows/ci.yml)
