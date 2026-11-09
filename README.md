@@ -47,6 +47,11 @@ The rider ratified at midnight. The baseline was snapshotted. The chain was root
 
 No real money has been traded. The engine still can't write its own ledger rows. But the government works, and the republic of three mystical animals waits, patient and audit-ready, for the day the paper mode gate opens.
 
+*"Checks fail closed: an unverified constitution halts business, it does not proceed on assumption."*
+— INTEGRITY_CHECKS.md §5
+
+*A well-reported defect is a win.* 🪷🦉🐺
+
 
 ## Features
 
@@ -61,11 +66,6 @@ No real money has been traded. The engine still can't write its own ledger rows.
 - **One-command rebuild** — `rebuild-openclaw.sh` backs up, tears down, regenerates, self-heals the config, inspects (12 checkpoints), builds and boots
 
 ---
-
-*"Checks fail closed: an unverified constitution halts business, it does not proceed on assumption."*
-— INTEGRITY_CHECKS.md §5
-
-*A well-reported defect is a win.* 🪷🦉🐺
 
 
 ## Architecture at a glance
