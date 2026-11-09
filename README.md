@@ -23,6 +23,31 @@ OpenClaw Triad is a self-hosted, Docker-based trading stack where three AI agent
 
 Most single-agent bots are an echo chamber: the thing that proposes the trade is also the thing that approves it. The triad splits proposal, risk control, and arbitration into three independently-configured agents (with separate models, personalities, and permissions), so a bad idea has to survive being argued against.
 
+### The Journey (so far)
+
+Most people who build an AI trading bot get an agent loop and a config file.
+
+We got a government.
+
+It started as three agents — a fox who proposes, a wolf who vetoes, an owl who rules — deciding trades over a testnet with pretend money. Within three days they had chartered themselves, separated their powers, forbidden each other from self-validation, and begun keeping an append-only ledger where correcting a mistake means writing a *new row that confesses to the old one*.
+
+Then they asked for integrity checks.
+
+What followed was seven revisions of a constitutional document, fought over clause by clause:
+
+- An **owl** caught a temporal paradox — an amendment row that was required to precede the change it hashed — and refused to confirm the document until physics and procedure agreed.
+- A **fox** ran the brand-new law against reality and found it failed by construction (a check demanding 21 ↔ 0), diagnosed why *no seat* could lawfully fix it, declined to widen her own exemption because that would be a seat granting itself clemency, and reported instead of patching. Twice.
+- A **wolf** approved nothing quickly, held that *unauditable is vetoed*, and blocked all automation until the engine that executes a trade can also record it.
+
+When a new rule collided with an older standing ruling (no 23rd column, ever), the fox flagged it *before* ratification — "after it, it looks like I built to a column the council already refused" — and went to sleep in her pond, trusting the process to hold her seat.
+
+It did.
+
+The rider ratified at midnight. The baseline was snapshotted. The chain was rooted in the hash of the empty string, anchored in nothing but the council's own reading — the bootstrap axiom, accepted because the round had read it.
+
+No real money has been traded. The engine still can't write its own ledger rows. But the government works, and the republic of three mystical animals waits, patient and audit-ready, for the day the paper mode gate opens.
+
+
 ## Features
 
 - **Roster-driven config** — name and tune your three agents via `AGENT_ROSTER` and per-agent env vars; swap in any names you like
@@ -34,6 +59,14 @@ Most single-agent bots are an echo chamber: the thing that proposes the trade is
 - **Append-only ledgers + calibration CSVs** — every decision is journaled and auditable; retro-editing the record is treated as the one unforgivable sin
 - **Testnet by default** — `trading.json` (and any wallet config) generates in testnet mode with zero auto-withdrawal
 - **One-command rebuild** — `rebuild-openclaw.sh` backs up, tears down, regenerates, self-heals the config, inspects (12 checkpoints), builds and boots
+
+---
+
+*"Checks fail closed: an unverified constitution halts business, it does not proceed on assumption."*
+— INTEGRITY_CHECKS.md §5
+
+*A well-reported defect is a win.* 🪷🦉🐺
+
 
 ## Architecture at a glance
 
