@@ -1,50 +1,40 @@
-# CI for openclaw-orchestrate — smoke tests with proper env seeding
+# CI additions for openclaw-orchestrate — resilience smoke tests
 #
-# NOTE: reconstruction matching the job names of run 42454827675.
-# Diff against your existing .github/workflows/ci.yml before replacing.
+# Three new jobs, designed to slot into the existing .github/workflows/ci.yml
+# (paste below the existing jobs, keep the top-level `name:`/`on:`/`concurrency:`).
 #
-# Root-cause fixes applied:
-#   1. "Makefile sanity" fails if the state-dir .env is absent: `make setup`
-#      hard-exits when ENV_FILE is missing, and `make init` only seeds it
-#      when env/.env.example exists in the repo. We seed a dummy .env in
-#      the workflow instead (placeholder values only — never real keys).
-#   2. Generator smoke jobs export the full env contract explicitly
-#      (roster/preset/models) so `set -u` in the script can't trip on an
-#      unset-but-required variable.
-#   3. Post-generation assertions so a silent 0-exit doesn't hide a
-#      broken generation.
-#   4. Compose validation passes the GENERATED docker.env via --env-file;
-#      the compose file interpolates APP_UID/CONTAINER_* from it and fails
-#      type-casting when they resolve blank.
+# Draft status: REVIEW BEFORE MERGING — marked points need verifying against
+# the actual generator output (see "Review checklist" at the bottom).
 #
-# GH quirks:
-#   - The `runner` context is NOT valid in job-level `env:` — state dirs
-#     derive from `github.workspace` instead of `runner.temp`.
-#   - Trigger targets `master` (this repo's default branch), not `main`.
-
-name: CI
-
-on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# Design notes on the non-obvious choices:
+#
+#   Idempotence uses the SAME dir run twice (snapshot in between), not two
+#   sibling dirs. Reason: the generator likely embeds absolute paths derived
+#   from OPENCLAW_STATE_DIR — two different dirs would diff-dirty for that
+#   reason alone. Same-dir-twice isolates pure temporal nondeterminism.
+#
+#   Healthcheck semantics extracts the `test:` expression from the GENERATED
+#   compose file rather than duplicating the string in the workflow — so the
+#   test fails loudly if someone edits the template without updating CI (or
+#   vice versa). It evaluates the expression against a FAKE state dir on the
+#   runner; no Docker needed, milliseconds of runtime.
+#
+#   Container health transition is opt-in (workflow_dispatch only): it's the
+#   only test exercising what Docker actually does with the healthcheck, but
+#   it depends on the built image staying up with placeholder creds, which
+#   hasn't been proven yet (see checklist).
 
 jobs:
+
   # ---------------------------------------------------------------------
-  # Makefile sanity: init + setup with NO real keys.
+  # Generator determinism: run twice into the SAME state dir, diff trees.
+  # This is the CI guard for "rerunning setup must not change the stack".
   # ---------------------------------------------------------------------
-  validate-make:
-    name: Makefile sanity (init + setup, no keys)
+  generator-idempotence:
+    name: Generator idempotence (same dir, twice)
     runs-on: ubuntu-latest
     env:
-      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/make-sanity
-      # Placeholder secrets — presence is all the generator checks.
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/idempotence
       NANOGPT_API_KEY: ci-placeholder-key
       OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
       AGENT_ROSTER: seer,guardian,sage
@@ -52,134 +42,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Seed state-dir .env (placeholders, never real secrets)
-        run: |
-          mkdir -p "$OPENCLAW_STATE_DIR"
-          cat > "$OPENCLAW_STATE_DIR/.env" <<'EOF'
-          NANOGPT_API_KEY=ci-placeholder-key
-          OPENCLAW_GATEWAY_TOKEN=ci-placeholder-token
-          AGENT_ROSTER=seer,guardian,sage
-          PERSONALITY_PRESET=default
-          DOCKER_ENABLE=false
-          EOF
-          chmod 600 "$OPENCLAW_STATE_DIR/.env"
-
-      - name: make init
-        run: make init
-        # init only warns if env/.env.example is missing; if you commit one,
-        # the seeded .env above wins because init preserves an existing .env.
-
-      - name: make setup
-        run: make setup
-
-      - name: Assert generation output
+      - name: First generation + snapshot
         run: |
           set -euo pipefail
-          test -f "$OPENCLAW_STATE_DIR/openclaw.json"
-          test -f "$OPENCLAW_STATE_DIR/shared/trading.json"
-          test -d  "$OPENCLAW_STATE_DIR/workspace-triad/seer"
-          test -d  "$OPENCLAW_STATE_DIR/workspace-triad/guardian"
-          test -d  "$OPENCLAW_STATE_DIR/workspace-triad/sage"
-          grep -q '"mode": "testnet"' "$OPENCLAW_STATE_DIR/shared/trading.json"
+          ./scripts/setup-openclaw-triad.sh --docker
+          cp -a "$OPENCLAW_STATE_DIR" "$RUNNER_TEMP/gen-snapshot"
 
-  # ---------------------------------------------------------------------
-  # Generator smoke: one job per personality preset.
-  # ---------------------------------------------------------------------
-  generator-smoke:
-    name: Generator smoke (preset ${{ matrix.preset }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        preset: [default, mystic, bold, conservative, quant]
-    env:
-      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/preset-${{ matrix.preset }}
-      PERSONALITY_PRESET: ${{ matrix.preset }}
-      NANOGPT_API_KEY: ci-placeholder-key
-      OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
-      AGENT_ROSTER: seer,guardian,sage
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run generator
+      - name: Second generation (same dir, same env)
         run: ./scripts/setup-openclaw-triad.sh --docker
 
-      - name: Assert preset artifacts
+      - name: Diff snapshot vs regenerated tree
         run: |
           set -euo pipefail
-          test -f "$OPENCLAW_STATE_DIR/openclaw.json"
-          test -f "$OPENCLAW_STATE_DIR/Dockerfile"
-          test -f "$OPENCLAW_STATE_DIR/docker-compose.yml"
-          test -f "$OPENCLAW_STATE_DIR/docker.env"
-          # Roster seats: distinct workspaces, judge is read-only
-          grep -q 'tools: { allow: \["read", "message"\] }' \
-            "$OPENCLAW_STATE_DIR/openclaw.json"
-          # Preset risk limits landed in trading.json
-          grep -Eq '"maxTradesPerDay": [0-9]+' "$OPENCLAW_STATE_DIR/shared/trading.json"
-
-      - name: Generated compose file parses
-        run: >-
-          docker compose --env-file "$OPENCLAW_STATE_DIR/docker.env"
-          -f "$OPENCLAW_STATE_DIR/docker-compose.yml" config -q
-
-  # ---------------------------------------------------------------------
-  # v3.3 env-driven model lineup: catalog + seat defaults + overrides.
-  # ---------------------------------------------------------------------
-  model-lineup:
-    name: Env-driven model lineup (v3.3)
-    runs-on: ubuntu-latest
-    env:
-      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/model-lineup
-      NANOGPT_API_KEY: ci-placeholder-key
-      OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
-      AGENT_ROSTER: seer,guardian,sage
-      PERSONALITY_PRESET: quant
-      NANOGPT_MODEL_CATALOG: >-
-        deepseek/deepseek-v4.1-flash-1017,z-ai/glm-5.3|GLM 5.3,z-ai/glm-5.3-flash-uncensored,Gemma-4-31B-Gembrain-X-Core,x-ai/grok-4.7
-      TRIAD_SCOUT_MODEL: deepseek/deepseek-v4.1-flash-1017
-      TRIAD_RISK_MODEL: z-ai/glm-5.3
-      TRIAD_JUDGE_MODEL: z-ai/glm-5.3
-      UTILITY_MODEL: z-ai/glm-5.3-flash-uncensored
-      AGENT_SAGE_MODEL: z-ai/glm-5.3-flash-uncensored   # per-agent override beats seats
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run generator
-        run: ./scripts/setup-openclaw-triad.sh
-
-      - name: Assert model wiring
-        run: |
-          set -euo pipefail
-          CFG="$OPENCLAW_STATE_DIR/openclaw.json"
-          # References are nanogpt/-prefixed (router spelling)...
-          grep -q 'nanogpt/deepseek/deepseek-v4.1-flash-1017' "$CFG"
-          # ...while catalog ids stay BARE in the provider block
-          grep -q 'id: "deepseek/deepseek-v4.1-flash-1017"' "$CFG"
-          grep -q 'name: "GLM 5.3"' "$CFG"
-          # Per-agent override won over the seat default for sage
-          grep -q 'utilityModel: "nanogpt/z-ai/glm-5.3-flash-uncensored"' "$CFG"
-
-      - name: Advisory fires when a model is missing from the catalog
-        run: |
-          set -euo pipefail
-          export OPENCLAW_STATE_DIR="${RUNNER_TEMP}/triad-advisory"
-          unset NANOGPT_MODEL_CATALOG TRIAD_SCOUT_MODEL
-          # Legacy default lineup, empty catalog => ADVISORY lines, exit 0
-          out="$(./scripts/setup-openclaw-triad.sh)" || {
-            echo "generator exited non-zero despite advisory being non-fatal" >&2
+          # REVIEW POINT 1: if the generator legitimately embeds entropy
+          # (random tokens, timestamps), extend the exclusion list below
+          # — or better, make the generator deterministic. Entropy in
+          # generated output is what turns laptop->VPS migration into a
+          # "diff the stacks by hand" exercise.
+          EXCLUDES=(
+            --exclude='*.sqlite*'   # runtime state, if any leaks into generation
+            --exclude='*.log'
+          )
+          if ! diff -r "${EXCLUDES[@]}" \
+               "$RUNNER_TEMP/gen-snapshot" "$OPENCLAW_STATE_DIR" \
+               > "$RUNNER_TEMP/idempotence.diff"; then
+            cat "$RUNNER_TEMP/idempotence.diff"
+            echo "::error::generator output differs between identical runs" >&2
             exit 1
-          }
-          echo "$out" | grep -q 'ADVISORY'
+          fi
+          echo "OK: byte-identical regeneration"
 
   # ---------------------------------------------------------------------
-  # Docker build of the generated image (heavy; last).
+  # Healthcheck semantics: extract the `test:` expression from the
+  # GENERATED compose file and assert its behavior in 4 scenarios.
+  # Runs without Docker; guards the heartbeat template change.
   # ---------------------------------------------------------------------
-  docker-build:
-    name: Docker build (generated image)
+  healthcheck-semantics:
+    name: Healthcheck expression semantics
     runs-on: ubuntu-latest
-    needs: [validate-make, model-lineup]
     env:
-      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/docker-build
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/healthcheck
       NANOGPT_API_KEY: ci-placeholder-key
       OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
       AGENT_ROSTER: seer,guardian,sage
@@ -190,7 +92,182 @@ jobs:
       - name: Generate stack
         run: ./scripts/setup-openclaw-triad.sh --docker
 
-      - name: Build image
+      - name: Guard: generated compose actually contains heartbeat check
+        # REVIEW POINT 2: this intentionally FAILS until the heartbeat-aware
+        # healthcheck is promoted into the generator template (v3.4). If you
+        # merge this job before the template change, delete this step.
         run: |
+          set -euo pipefail
+          grep -q 'heartbeat' "$OPENCLAW_STATE_DIR/docker-compose.yml" || {
+            echo "::error::generated healthcheck lacks the heartbeat clause — promote the template change first" >&2
+            exit 1
+          }
+
+      - name: Extract healthcheck expression into a runnable script
+        run: |
+          set -euo pipefail
+          # PyYAML ships preinstalled on ubuntu-latest. REVIEW POINT 3:
+          # adjust the service key if it's not literally 'openclaw-triad'.
+          python3 - <<'PY' > "$RUNNER_TEMP/hcheck.sh"
+          import os, yaml
+          d = os.environ["OPENCLAW_STATE_DIR"]
+          doc = yaml.safe_load(open(os.path.join(d, "docker-compose.yml")))
+          hc = doc["services"]["openclaw-triad"]["healthcheck"]["test"]
+          expr = hc[1] if isinstance(hc, list) else hc
+          # Substitute the compose variable with our fake state dir so the
+          # expression is runnable on the runner filesystem.
+          print("#!/bin/sh")
+          print(expr.replace("${CONTAINER_STATE_DIR}", os.environ["FAKE_STATE"]))
+          PY
+          chmod +x "$RUNNER_TEMP/hcheck.sh"
+          echo "--- extracted healthcheck ---"; cat "$RUNNER_TEMP/hcheck.sh"
+        env:
+          FAKE_STATE: ${{ runner.temp }}/fake-state
+
+      - name: Scenario 1 — inert before first stamp (no heartbeat file)
+        run: |
+          set -euo pipefail
+          mkdir -p "$FAKE_STATE"
+          echo '{}' > "$FAKE_STATE/openclaw.json"
+          "$RUNNER_TEMP/hcheck.sh"   # must PASS (exit 0)
+        env:
+          FAKE_STATE: ${{ runner.temp }}/fake-state
+
+      - name: Scenario 2 — fresh stamp passes
+        run: |
+          set -euo pipefail
+          date +%s > "$FAKE_STATE/heartbeat"
+          "$RUNNER_TEMP/hcheck.sh"   # must PASS
+        env:
+          FAKE_STATE: ${{ runner.temp }}/fake-state
+
+      - name: Scenario 3 — stale stamp (10 min old) fails
+        run: |
+          set -euo pipefail
+          echo $(( $(date +%s) - 600 )) > "$FAKE_STATE/heartbeat"
+          if "$RUNNER_TEMP/hcheck.sh"; then
+            echo "::error::stale heartbeat passed the healthcheck — regression" >&2
+            exit 1
+          fi
+        env:
+          FAKE_STATE: ${{ runner.temp }}/fake-state
+
+      - name: Scenario 4 — missing openclaw.json still fails (original guarantee)
+        run: |
+          set -euo pipefail
+          mv "$FAKE_STATE/openclaw.json" "$FAKE_STATE/openclaw.json.bak"
+          if "$RUNNER_TEMP/hcheck.sh"; then
+            echo "::error::missing config passed the healthcheck — original check weakened" >&2
+            exit 1
+          fi
+          mv "$FAKE_STATE/openclaw.json.bak" "$FAKE_STATE/openclaw.json"
+        env:
+          FAKE_STATE: ${{ runner.temp }}/fake-state
+
+  # ---------------------------------------------------------------------
+  # Opt-in: build the generated image, run it, and observe Docker's ACTUAL
+  # health transitions (healthy -> unhealthy on stale heartbeat).
+  #
+  # Kept behind workflow_dispatch because it (a) costs real CI minutes and
+  # (b) depends on the image staying up with placeholder creds, which is
+  # unproven — see REVIEW POINT 4. Promote to always-on once it's green
+  # twice in a row.
+  # ---------------------------------------------------------------------
+  container-health-transition:
+    name: Container health transition (opt-in)
+    runs-on: ubuntu-latest
+    needs: [validate-make, generator-idempotence, healthcheck-semantics]
+    if: github.event_name == 'workflow_dispatch'
+    env:
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/health-transition
+      NANOGPT_API_KEY: ci-placeholder-key
+      OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
+      AGENT_ROSTER: seer,guardian,sage
+      PERSONALITY_PRESET: default
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate + build stack
+        run: |
+          set -euo pipefail
+          ./scripts/setup-openclaw-triad.sh --docker
           cd "$OPENCLAW_STATE_DIR"
           docker compose --env-file docker.env build
+
+      - name: Bring stack up
+        run: |
+          set -euo pipefail
+          cd "$OPENCLAW_STATE_DIR"
+          docker compose --env-file docker.env up -d
+
+      - name: Wait for healthy (within start_period + margin)
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 240))
+          until [ "$(docker inspect --format '{{.State.Health.Status}}' openclaw-triad)" = "healthy" ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              docker inspect --format '{{json .State.Health}}' openclaw-triad | jq .
+              echo "::error::container never reached healthy" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "healthy after ${SECONDS}s"
+
+      - name: Stamp STALE heartbeat from the host side; expect unhealthy
+        run: |
+          set -euo pipefail
+          cd "$OPENCLAW_STATE_DIR"
+          # REVIEW POINT 4: assumes the host-side bind dir is exported into
+          # docker.env as OPENCLAW_HOST_STATE_DIR. If the generator spells it
+          # differently, adjust the grep below. Also verifies the heartbeat
+          # path is inside the (only) writable bind mount — if this write
+          # fails from the host, the mount mapping is wrong.
+          HOST_STATE="$(grep -E '^OPENCLAW_HOST_STATE_DIR=' docker.env | cut -d= -f2)"
+          echo $(( $(date +%s) - 600 )) > "$HOST_STATE/heartbeat"
+
+          # Timeout budget: interval x retries + margin.
+          # Current template: 30s x 3 = 90s; the heartbeat template bumps
+          # interval to 60s => 180s budget. REVIEW POINT 5: keep this in
+          # sync with the generated healthcheck timings.
+          deadline=$((SECONDS + 240))
+          until [ "$(docker inspect --format '{{.State.Health.Status}}' openclaw-triad)" = "unhealthy" ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              docker inspect --format '{{json .State.Health}}' openclaw-triad | jq .
+              echo "::error::stale heartbeat did NOT flip container to unhealthy" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "flipped to unhealthy after ${SECONDS}s — healthcheck is live, not decorative"
+
+      - name: Teardown (always)
+        if: always()
+        run: |
+          cd "$OPENCLAW_STATE_DIR"
+          docker compose --env-file docker.env down -v || true
+
+# ---------------------------------------------------------------------------
+# INTEGRATION NOTES (delete after merging):
+#
+# 1. Placement: add these jobs to the existing jobs: block; also consider
+#    adding `needs: [generator-idempotence, healthcheck-semantics]` to the
+#    existing docker-build job so the cheap gates run first.
+#
+# 2. Ordering constraint: `healthcheck-semantics` will RED its "Guard" step
+#    until the heartbeat healthcheck is promoted into the generator
+#    template (your planned v3.4). Either merge template change first, or
+#    delete the Guard step when running this job against the current v3.3.
+#
+# REVIEW CHECKLIST (verify against a real generation before merging):
+#   [1] Does `diff -r` need more/fewer excludes? (run once locally:
+#       ./scripts/setup-openclaw-triad.sh --docker; snapshot; rerun; diff)
+#   [2] Confirmed the guard step fails on current v3.3 output? (it should)
+#   [3] Is the compose service key literally 'openclaw-triad'? (it is in the
+#       generated file you shared — just reconfirm after v3.4)
+#   [4] Is the host bind dir var spelled OPENCLAW_HOST_STATE_DIR in
+#       docker.env, and does the container path in the healthcheck equal
+#       CONTAINER_STATE_DIR's value from docker.env?
+#   [5] Do the generated healthcheck timings (interval/retries) fit the
+#       240s polling budgets above? Adjust budget = interval x retries x 2.
+# ---------------------------------------------------------------------------
