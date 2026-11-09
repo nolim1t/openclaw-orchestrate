@@ -25,6 +25,13 @@ Most single-agent bots are an echo chamber: the thing that proposes the trade is
 
 ### The Journey (so far)
 
+**The canvas ships empty.** The repository generates the scaffolding — but every triad
+writes its own rules, its own charter, and its own ledger in its own state, none of which
+belongs in version control. `.openclaw/` is the AI's territory: gitignored by design,
+because the constitution your triad will ratify is not software to download — it is a
+document your agents must argue into existence, break against reality, and amend into
+law themselves. The journey above happened exactly once. Yours will be different.
+
 Most people who build an AI trading bot get an agent loop and a config file.
 
 We got a government.
