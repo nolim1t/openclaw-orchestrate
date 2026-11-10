@@ -247,31 +247,33 @@ pref() {  # reference spelling for a model id, per active mode/era
 # Consistency advisory: every referenced model should be in the catalog.
 # Loud but non-fatal — the runtime is the final judge at transport time.
 ADVISE_MISSING=0
-advise_check() {  # advise_check <label> <bare-id>
-    if is_ollama_only; then
-        # Seats must be in the generated ollama fleet, not the nanogpt catalog.
-        ollama_fleet_has() {
-            case ",qwen3:0.6b,qwen3:1.7b," in
-                *",$1,"*) return 0 ;;
-                *)        return 1 ;;
-            esac
-        }
-        for _seat in "$SCOUT_MODEL_DEFAULT" "$RISK_MODEL_DEFAULT" \
-                    "$JUDGE_MODEL_DEFAULT" "$UTILITY_MODEL_DEFAULT"; do
-            if ! ollama_fleet_has "$_seat"; then
+advise_missing_model() {  # <label> <bare-id>
+    echo "   [!] ADVISORY: ${1} model '${2}' is NOT in NANOGPT_MODEL_CATALOG."
+    echo "       Add it to the catalog (or fix the seat var) — the provider"
+    echo "       may reject it at transport time."
+    ADVISE_MISSING=$((ADVISE_MISSING + 1))
+}
+
+if is_ollama_only; then
+    # Seats must be in the generated ollama fleet, not the nanogpt catalog.
+    for _seat in "$SCOUT_MODEL_DEFAULT" "$RISK_MODEL_DEFAULT" \
+                 "$JUDGE_MODEL_DEFAULT" "$UTILITY_MODEL_DEFAULT"; do
+        case ",qwen3:0.6b,qwen3:1.7b," in
+            *",$_seat,"*) ;;  # in fleet
+            *)
                 echo "   [!] ADVISORY: OLLAMA model '${_seat}' is not in the generated"
                 echo "       ollama provider fleet (qwen3:0.6b, qwen3:1.7b). Add it to"
                 echo "       the ollama providers block before boot."
                 ADVISE_MISSING=$((ADVISE_MISSING + 1))
-            fi
-        done
-    else
-        advise_check "scout seat" "$SCOUT_MODEL_DEFAULT"
-        advise_check "risk seat"  "$RISK_MODEL_DEFAULT"
-        advise_check "judge seat" "$JUDGE_MODEL_DEFAULT"
-        advise_check "utility"    "$UTILITY_MODEL_DEFAULT"
-    fi
-}
+                ;;
+        esac
+    done
+else
+    catalog_has "$SCOUT_MODEL_DEFAULT"   || advise_missing_model "scout seat" "$SCOUT_MODEL_DEFAULT"
+    catalog_has "$RISK_MODEL_DEFAULT"    || advise_missing_model "risk seat"  "$RISK_MODEL_DEFAULT"
+    catalog_has "$JUDGE_MODEL_DEFAULT"   || advise_missing_model "judge seat" "$JUDGE_MODEL_DEFAULT"
+    catalog_has "$UTILITY_MODEL_DEFAULT" || advise_missing_model "utility"    "$UTILITY_MODEL_DEFAULT"
+fi
 
 ###############################################################################
 # BASH 3.2-SAFE HELPERS
