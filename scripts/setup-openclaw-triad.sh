@@ -72,6 +72,10 @@ Env-driven configuration (read from environment; Makefile sources .env):
   BASE_IMAGE               default node:24-slim
   OPENCLAW_VERSION         npm version of openclaw runtime (default latest)
   DOCKER_ENABLE=true       emit Docker files (or pass --docker)
+  OLLAMA_ONLY=1            all seats + utility on the local Ollama provider
+                           (testnet/CI mode; judgment quality is NOT calibrated)
+  OLLAMA_BASE_URL          container-view Ollama endpoint
+  OLLAMA_SCOUT/RISK/JUDGE/UTILITY_MODEL  per-seat ollama model ids (bare)  
 
 Model spelling rules (the generator handles BOTH for you):
   - Catalog ids are BARE ("vendor/model-id") — what the NanoGPT API expects.
@@ -88,25 +92,6 @@ USAGEEOF
     exit 0
 }
 
-
-## Ollama model utility functions
-write_ollama_provider() {
-  # Emits the ollama provider entry for openclaw.json models.providers.
-  # Bare catalog ids (what the local API expects); config refs elsewhere
-  # are "ollama/"-prefixed (what the router expects) — mirrors the
-  # nanogpt convention exactly.
-  cat <<EOF
-      "ollama": {
-        "baseUrl": "${OLLAMA_BASE_URL}",
-        "apiKey": "ollama-local",
-        "api": "openai-completions",
-        "models": [
-          { "id": "qwen3:0.6b", "name": "qwen3-0.6b" },
-          { "id": "qwen3:1.7b", "name": "qwen3-1.7b" }
-        ]
-      }
-EOF
-}
 
 is_ollama_only() {
   [ "${OLLAMA_ONLY:-0}" = "1" ]
@@ -190,6 +175,14 @@ DOCKER_ENABLE="${DOCKER_ENABLE:-false}"
 WALLET_TYPE="${WALLET_TYPE_ARG:-${WALLET_TYPE:-}}"
 WALLET_AGENT="${WALLET_AGENT:-$RISK}"
 USE_WALLET=false; [[ -n "$WALLET_TYPE" ]] && USE_WALLET=true
+# --- Ollama (local LLM; only consumed when OLLAMA_ONLY=1) ------------------
+# Container-view URL by default; the generation-time preflight separately
+# probes the host view (localhost). See ollama_preflight().
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}"
+OLLAMA_SCOUT_MODEL="${OLLAMA_SCOUT_MODEL:-qwen3:1.7b}"
+OLLAMA_RISK_MODEL="${OLLAMA_RISK_MODEL:-qwen3:1.7b}"
+OLLAMA_JUDGE_MODEL="${OLLAMA_JUDGE_MODEL:-qwen3:1.7b}"
+OLLAMA_UTILITY_MODEL="${OLLAMA_UTILITY_MODEL:-qwen3:0.6b}"
 
 ###############################################################################
 # MODEL LINEUP RESOLUTION (v3.3 — env-driven)
@@ -226,39 +219,58 @@ catalog_has() {
 }
 
 
+# Seat defaults are BARE ids in BOTH modes; pref() adds the prefix at
+# reference time (fixes the double-prefix bug: ollama/… and nanogpt/
+# must each be added exactly once).
 if is_ollama_only; then
-  SCOUT_MODEL_DEFAULT="ollama/${OLLAMA_SCOUT_MODEL}"
-  RISK_MODEL_DEFAULT="ollama/${OLLAMA_RISK_MODEL}"
-  JUDGE_MODEL_DEFAULT="ollama/${OLLAMA_JUDGE_MODEL}"
-  UTILITY_MODEL_DEFAULT="ollama/${OLLAMA_UTILITY_MODEL}"
-  FALLBACKS_JSON='["ollama/qwen3:0.6b"]'
+    SCOUT_MODEL_DEFAULT="$OLLAMA_SCOUT_MODEL"
+    RISK_MODEL_DEFAULT="$OLLAMA_RISK_MODEL"
+    JUDGE_MODEL_DEFAULT="$OLLAMA_JUDGE_MODEL"
+    UTILITY_MODEL_DEFAULT="$OLLAMA_UTILITY_MODEL"
 else
-    # Seat defaults (bare ids — the prefix is added at reference time).
-    SCOUT_MODEL_DEFAULT="nanogpt/${TRIAD_SCOUT_MODEL:-deepseek/deepseek-v4.1-flash-1017}"
+    SCOUT_MODEL_DEFAULT="${TRIAD_SCOUT_MODEL:-deepseek/deepseek-v4.1-flash-1017}"
     RISK_MODEL_DEFAULT="${TRIAD_RISK_MODEL:-anthropic/claude-opus-4-6}"
     JUDGE_MODEL_DEFAULT="${TRIAD_JUDGE_MODEL:-anthropic/claude-opus-4-6}"
     UTILITY_MODEL_DEFAULT="${UTILITY_MODEL:-openai/gpt-5.4-mini}"
 fi
 
-pref() {  # nanogpt-era reference spelling for a model id
-    if [[ "$NANOGPT_ERA" == "true" ]]; then echo "nanogpt/$1"; else echo "$1"; fi
+pref() {  # reference spelling for a model id, per active mode/era
+    if is_ollama_only; then
+        echo "ollama/$1"
+    elif [[ "$NANOGPT_ERA" == "true" ]]; then
+        echo "nanogpt/$1"
+    else
+        echo "$1"
+    fi
 }
-
 # Consistency advisory: every referenced model should be in the catalog.
 # Loud but non-fatal — the runtime is the final judge at transport time.
 ADVISE_MISSING=0
 advise_check() {  # advise_check <label> <bare-id>
-    if ! catalog_has "$2"; then
-        echo "   [!] ADVISORY: ${1} model '${2}' is NOT in NANOGPT_MODEL_CATALOG."
-        echo "       Add it to the catalog (or fix the seat var) — the provider"
-        echo "       may reject it at transport time."
-        ADVISE_MISSING=$((ADVISE_MISSING + 1))
+    if is_ollama_only; then
+        # Seats must be in the generated ollama fleet, not the nanogpt catalog.
+        ollama_fleet_has() {
+            case ",qwen3:0.6b,qwen3:1.7b," in
+                *",$1,"*) return 0 ;;
+                *)        return 1 ;;
+            esac
+        }
+        for _seat in "$SCOUT_MODEL_DEFAULT" "$RISK_MODEL_DEFAULT" \
+                    "$JUDGE_MODEL_DEFAULT" "$UTILITY_MODEL_DEFAULT"; do
+            if ! ollama_fleet_has "$_seat"; then
+                echo "   [!] ADVISORY: OLLAMA model '${_seat}' is not in the generated"
+                echo "       ollama provider fleet (qwen3:0.6b, qwen3:1.7b). Add it to"
+                echo "       the ollama providers block before boot."
+                ADVISE_MISSING=$((ADVISE_MISSING + 1))
+            fi
+        done
+    else
+        advise_check "scout seat" "$SCOUT_MODEL_DEFAULT"
+        advise_check "risk seat"  "$RISK_MODEL_DEFAULT"
+        advise_check "judge seat" "$JUDGE_MODEL_DEFAULT"
+        advise_check "utility"    "$UTILITY_MODEL_DEFAULT"
     fi
 }
-advise_check "scout seat" "$SCOUT_MODEL_DEFAULT"
-advise_check "risk seat"  "$RISK_MODEL_DEFAULT"
-advise_check "judge seat" "$JUDGE_MODEL_DEFAULT"
-advise_check "utility"    "$UTILITY_MODEL_DEFAULT"
 
 ###############################################################################
 # BASH 3.2-SAFE HELPERS
@@ -476,38 +488,106 @@ fi
 # ownership, verbatim display names, no swarm, no bindings arrays)
 ###############################################################################
 
-# nanogpt provider block (only in the nanogpt era). NOTE: apiKey stays the
-# LITERAL text ${NANOGPT_API_KEY} — openclaw interpolates env at runtime.
-MODELS_BLOCK=""
+###############################################################################
+# PROVIDERS ASSEMBLY (nanogpt AND/OR ollama)
+###############################################################################
+
+PROVIDERS=()
+
 if [[ "$NANOGPT_ERA" == "true" ]]; then
-    MODELS_BLOCK=$(cat << EOMB
-  models: {
-    mode: "merge",
-    providers: {
-      nanogpt: {
-        baseUrl: "https://nano-gpt.com/api/v1",
-        apiKey: "${NANOGPT_API_KEY}",
-        api: "openai-completions",
+    PROVIDERS+=("      nanogpt: {
+        baseUrl: \"https://nano-gpt.com/api/v1\",
+        apiKey: \"${NANOGPT_API_KEY}\",
+        api: \"openai-completions\",
         models: [${MODELS_ENTRIES}
         ]
-      }
-    }
-  },
-EOMB
-)
+      }")
 fi
+
+if is_ollama_only; then
+    # Bare catalog ids — what the local Ollama API expects. References in
+    # agents.* get the ollama/ prefix at reference time via pref().
+    # apiKey is the documented non-secret marker for loopback/LAN origins.
+    PROVIDERS+=("      ollama: {
+        baseUrl: \"${OLLAMA_BASE_URL}\",
+        apiKey: \"ollama-local\",
+        api: \"openai-completions\",
+        models: [
+          { id: \"qwen3:0.6b\", name: \"qwen3-0.6b\" },
+          { id: \"qwen3:1.7b\", name: \"qwen3-1.7b\" }
+        ]
+      }")
+fi
+
+MODELS_BLOCK=""
+if [[ "${#PROVIDERS[@]}" -gt 0 ]]; then
+    PROVIDERS_JOINED=""
+    _pi=0
+    _pn="${#PROVIDERS[@]}"
+    for _pf in "${PROVIDERS[@]}"; do
+        _pi=$((_pi + 1))
+        PROVIDERS_JOINED="${PROVIDERS_JOINED}${_pf}"
+        [[ "$_pi" -lt "$_pn" ]] && PROVIDERS_JOINED="${PROVIDERS_JOINED},"
+        PROVIDERS_JOINED="${PROVIDERS_JOINED}
+"
+    done
+    MODELS_BLOCK="  models: {
+    mode: \"merge\",
+    providers: {
+${PROVIDERS_JOINED}    }
+  },"
+fi
+
+# wllama_preflight
+
+ollama_preflight() {
+    # Generation-time, HOST-side probe. The generator runs on the host where
+    # the Ollama server is localhost:11434 — OLLAMA_BASE_URL is the CONTAINER
+    # view (host.docker.internal) and may not resolve from the host itself.
+    # Container-side reachability is checked at boot time instead (see §8).
+    # Advisory-only: generation must succeed without an Ollama server.
+    is_ollama_only || return 0
+    local tags _m
+    tags="$(curl -sf --max-time 3 http://localhost:11434/api/tags 2>/dev/null || true)"
+    if [[ -z "$tags" ]]; then
+        echo "   [!] OLLAMA_ONLY=1 but no Ollama server answered on localhost:11434."
+        echo "       Generation succeeded, but BOOT will need it:"
+        echo "         ollama serve &        # if not already running"
+        return 0
+    fi
+    for _m in "$OLLAMA_SCOUT_MODEL" "$OLLAMA_RISK_MODEL" \
+              "$OLLAMA_JUDGE_MODEL" "$OLLAMA_UTILITY_MODEL"; do
+        case "$tags" in
+            *"\"${_m}\""*) ;;  # already pulled
+            *)
+                echo "   [!] Ollama is up but '${_m}' is not pulled yet:"
+                echo "         ollama pull ${_m}"
+                ;;
+        esac
+    done
+    echo "   [ok] Ollama preflight: server reachable on localhost:11434"
+    return 0
+}
 
 # Agent entries assembled in a variable (expanded now), spliced into the
 # config heredoc below. Entries carry ONLY schema-recognized keys.
 AGENT_ENTRIES=""
 for AGENT in "${ROSTER[@]}"; do
+    # Set defaults
+    SEAT_THINKING_DEFAULT="medium"
+    SEAT_REASONING_DEFAULT="on"
+    if is_ollama_only; then
+        # Sub-2B models: reasoning loops + unstable tool-call formatting.
+        SEAT_THINKING_DEFAULT="off"
+        SEAT_REASONING_DEFAULT="off"
+    fi
     case "$AGENT" in
         "$SCOUT") DEF_MODEL="$SCOUT_MODEL_DEFAULT" ;;
         "$RISK")  DEF_MODEL="$RISK_MODEL_DEFAULT"  ;;
         *)        DEF_MODEL="$JUDGE_MODEL_DEFAULT" ;;
     esac
     MODEL="$(agent_var "$AGENT" MODEL "$DEF_MODEL")"
-    THINK="$(agent_var "$AGENT" THINKING medium)"
+    THINK="$(agent_var "$AGENT" THINKING "${SEAT_THINKING_DEFAULT}")" 
     VOICE="$(agent_var "$AGENT" VOICE "${ELEVENLABS_VOICE_ID:-default}")"
 
     TTS=""
@@ -522,7 +602,6 @@ for AGENT in "${ROSTER[@]}"; do
     else
         TOOLS=", tools: { allow: [\"read\", \"message\"] }"
     fi
-
     AGENT_ENTRIES="${AGENT_ENTRIES}      ${AGENT}: {
         name: \"${AGENT}\",
         workspace: \"${CONTAINER_WORKSPACE_ROOT}/${AGENT}\",
@@ -533,7 +612,7 @@ for AGENT in "${ROSTER[@]}"; do
         },
         utilityModel: \"$(pref "$UTILITY_MODEL_DEFAULT")\",
         thinkingDefault: \"${THINK}\",
-        reasoningDefault: \"on\",
+        reasoningDefault: \"${SEAT_REASONING_DEFAULT}\",
         sandbox: { mode: \"off\" }${TOOLS}${TTS}
       },"
 done
@@ -562,8 +641,14 @@ ${AGENT_ENTRIES}
   }
 }
 EOJSON
-
+if is_ollama_only; then
+    echo "   mode   : OLLAMA_ONLY — all seats + utility on local Ollama."
+    echo "            Mechanics/testing only. Do NOT calibrate judgment"
+    echo "            quality from this mode's output."
+fi
 echo "   [ok] openclaw.json written (schema-valid, ownership explicit, sandbox off, systemAgent=${SCOUT})"
+# Write ollama stuff
+ollama_preflight
 
 ###############################################################################
 # TELEGRAM PLUGIN (roster-aware front-end)
