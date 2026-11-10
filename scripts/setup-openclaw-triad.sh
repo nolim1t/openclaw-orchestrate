@@ -167,14 +167,15 @@ PRESET="${PERSONALITY_PRESET:-default}"
 NANOGPT_KEY="${NANOGPT_API_KEY:-}"
 NANOGPT_ERA=false; [[ -n "$NANOGPT_KEY" ]] && NANOGPT_ERA=true
 TELEGRAM_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-TELEGRAM_ON=false; [[ -n "$TELEGRAM_TOKEN" ]] && TELEGRAM_ON=true
+TELEGRAM_ON=false; if [[ -n "$TELEGRAM_TOKEN" ]]; then TELEGRAM_ON=true; fi
 ELEVEN_KEY="${ELEVENLABS_API_KEY:-}"
-ELEVEN_ON=false; [[ -n "$ELEVEN_KEY" ]] && ELEVEN_ON=true
+ELEVEN_ON=false; if [[ -n "$ELEVEN_KEY" ]]; then ELEVEN_ON=true; fi
 DOCKER_ENABLE="${DOCKER_ENABLE:-false}"
 [[ "$DOCKER_FLAG" == "true" ]] && DOCKER_ENABLE=true
 WALLET_TYPE="${WALLET_TYPE_ARG:-${WALLET_TYPE:-}}"
 WALLET_AGENT="${WALLET_AGENT:-$RISK}"
-USE_WALLET=false; [[ -n "$WALLET_TYPE" ]] && USE_WALLET=true
+
+USE_WALLET=false; if [[ -n "$WALLET_TYPE" ]]; then USE_WALLET=true; fi
 # --- Ollama (local LLM; only consumed when OLLAMA_ONLY=1) ------------------
 # Container-view URL by default; the generation-time preflight separately
 # probes the host view (localhost). See ollama_preflight().
