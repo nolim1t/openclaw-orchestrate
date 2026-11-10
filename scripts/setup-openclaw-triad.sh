@@ -88,6 +88,30 @@ USAGEEOF
     exit 0
 }
 
+
+## Ollama model utility functions
+write_ollama_provider() {
+  # Emits the ollama provider entry for openclaw.json models.providers.
+  # Bare catalog ids (what the local API expects); config refs elsewhere
+  # are "ollama/"-prefixed (what the router expects) — mirrors the
+  # nanogpt convention exactly.
+  cat <<EOF
+      "ollama": {
+        "baseUrl": "${OLLAMA_BASE_URL}",
+        "apiKey": "ollama-local",
+        "api": "openai-completions",
+        "models": [
+          { "id": "qwen3:0.6b", "name": "qwen3-0.6b" },
+          { "id": "qwen3:1.7b", "name": "qwen3-1.7b" }
+        ]
+      }
+EOF
+}
+
+is_ollama_only() {
+  [ "${OLLAMA_ONLY:-0}" = "1" ]
+}
+
 ###############################################################################
 # ARGUMENTS
 ###############################################################################
@@ -201,11 +225,20 @@ catalog_has() {
     esac
 }
 
-# Seat defaults (bare ids — the prefix is added at reference time).
-SCOUT_MODEL_DEFAULT="${TRIAD_SCOUT_MODEL:-anthropic/claude-sonnet-4-6}"
-RISK_MODEL_DEFAULT="${TRIAD_RISK_MODEL:-anthropic/claude-opus-4-6}"
-JUDGE_MODEL_DEFAULT="${TRIAD_JUDGE_MODEL:-anthropic/claude-opus-4-6}"
-UTILITY_MODEL_DEFAULT="${UTILITY_MODEL:-openai/gpt-5.4-mini}"
+
+if is_ollama_only; then
+  SCOUT_MODEL_DEFAULT="ollama/${OLLAMA_SCOUT_MODEL}"
+  RISK_MODEL_DEFAULT="ollama/${OLLAMA_RISK_MODEL}"
+  JUDGE_MODEL_DEFAULT="ollama/${OLLAMA_JUDGE_MODEL}"
+  UTILITY_MODEL_DEFAULT="ollama/${OLLAMA_UTILITY_MODEL}"
+  FALLBACKS_JSON='["ollama/qwen3:0.6b"]'
+else
+    # Seat defaults (bare ids — the prefix is added at reference time).
+    SCOUT_MODEL_DEFAULT="nanogpt/${TRIAD_SCOUT_MODEL:-deepseek/deepseek-v4.1-flash-1017}"
+    RISK_MODEL_DEFAULT="${TRIAD_RISK_MODEL:-anthropic/claude-opus-4-6}"
+    JUDGE_MODEL_DEFAULT="${TRIAD_JUDGE_MODEL:-anthropic/claude-opus-4-6}"
+    UTILITY_MODEL_DEFAULT="${UTILITY_MODEL:-openai/gpt-5.4-mini}"
+fi
 
 pref() {  # nanogpt-era reference spelling for a model id
     if [[ "$NANOGPT_ERA" == "true" ]]; then echo "nanogpt/$1"; else echo "$1"; fi
@@ -728,6 +761,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       OPENCLAW_STATE_DIR: ${CONTAINER_STATE_DIR}
       OPENCLAW_WORKSPACE_DIR: ${CONTAINER_STATE_DIR}/workspace-triad
