@@ -235,12 +235,23 @@ jobs:
           path: ~/.ollama
           key: ollama-models-qwen3-0.6b-v1
 
-      - name: Pull model + start server
+      - name: Start server + pull model
         run: |
+          # Start the daemon only if nothing is already listening
+          if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
+            ollama serve > /tmp/ollama-serve.log 2>&1 &
+            for i in $(seq 1 30); do
+              curl -sf http://localhost:11434/api/tags > /dev/null && break
+              sleep 1
+            done
+          fi
+          curl -sf http://localhost:11434/api/tags > /dev/null || {
+            echo "ollama server did not come up; log:" >&2
+            cat /tmp/ollama-serve.log >&2 || true
+            exit 1
+          }
           ollama pull qwen3:0.6b
-          ollama serve &
-          sleep 3
-          curl -sf http://localhost:11434/api/tags > /dev/null
+          ollama list
 
       - name: Generate stack (ollama-only)
         run: ./scripts/setup-openclaw-triad.sh --docker
