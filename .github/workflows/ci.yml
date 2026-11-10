@@ -245,14 +245,15 @@ jobs:
 
       - name: Start server + pull model
         run: |
-          # Start the daemon only if nothing is already listening
-          if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
-            ollama serve > /tmp/ollama-serve.log 2>&1 &
-            for i in $(seq 1 30); do
-              curl -sf http://localhost:11434/api/tags > /dev/null && break
-              sleep 1
-            done
-          fi
+          # Kill any auto-started daemon (it binds loopback only); restart
+          # bound to 0.0.0.0 so containers can reach it via host-gateway.
+          pkill -f 'ollama serve' 2>/dev/null || true
+          sleep 1
+          OLLAMA_HOST=0.0.0.0:11434 ollama serve > /tmp/ollama-serve.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:11434/api/tags > /dev/null && break
+            sleep 1
+          done
           curl -sf http://localhost:11434/api/tags > /dev/null || {
             echo "ollama server did not come up; log:" >&2
             cat /tmp/ollama-serve.log >&2 || true
@@ -286,11 +287,14 @@ jobs:
       - name: Smoke agent round-trip
         run: ./scripts/smoke-agent-loop.sh
 
-      - name: Dump logs on failure
+      - name: Dump logs on failure and diagnose
         if: failure()
         run: |
           docker compose --env-file "$OPENCLAW_STATE_DIR/docker.env" \
             -f "$OPENCLAW_STATE_DIR/docker-compose.yml" logs --tail 200 || true
+          echo "--- smoke: container -> host network probe ---"
+          docker exec openclaw-triad getent hosts host.docker.internal || { echo "FAIL: host.docker.internal does not resolve in container" >&2; exit 1; }
+
 
       - name: Teardown
         if: always()
