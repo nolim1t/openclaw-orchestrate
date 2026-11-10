@@ -170,12 +170,20 @@ jobs:
             exit 1
           }
           echo "$out" | grep -q 'ADVISORY'
-      
-      - name: Test Ollama configs
+          
+      - name: Ollama-only generation invariants
+        env:
+          OLLAMA_ONLY: "1"
+          NANOGPT_API_KEY: ""          # empty => no nanogpt provider emitted
+          AGENT_SAGE_MODEL: ""         # don't let the quant-job override leak in
+          OPENCLAW_STATE_DIR: ${{ runner.temp }}/triad-ollama
         run: |
-          OLLAMA_ONLY=1 OPENCLAW_STATE_DIR="${RUNNER_TEMP}/triad-ollama" ./scripts/setup-openclaw-triad.sh >/dev/null
-          grep -q '"ollama"' "${RUNNER_TEMP}/triad-ollama/openclaw.json"
-          grep -q 'ollama/qwen3:1.7b' "${RUNNER_TEMP}/triad-ollama/openclaw.json"
+          set -euo pipefail
+          ./scripts/setup-openclaw-triad.sh > /dev/null
+          CFG="$OPENCLAW_STATE_DIR/openclaw.json"
+          grep -q 'ollama: {' "$CFG"                     # provider block present (unquoted key style)
+          ! grep -q 'nanogpt' "$CFG"                     # zero cloud leakage
+          grep -q 'ollama/qwen3:1.7b' "$CFG"             # seat refs use router spelling
 
   # ---------------------------------------------------------------------
   # Docker build of the generated image (heavy; last).
