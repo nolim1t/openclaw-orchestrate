@@ -18,10 +18,16 @@ TIMEOUT_S="${SMOKE_TIMEOUT:-120}"
 
 # --- 1. Static asserts on the generated config ---------------------------
 test -f "$CFG"
-grep -q '"ollama"' "$CFG" || { echo "FAIL: no ollama provider in config" >&2; exit 1; }
-grep -q 'ollama/qwen3' "$CFG" || { echo "FAIL: no ollama refs in agents" >&2; exit 1; }
+grep -q 'ollama: {' "$CFG" || { echo "FAIL: no ollama provider in config" >&2; exit 1; }
+grep -q 'primary: "ollama/qwen3' "$CFG" || { echo "FAIL: no ollama refs in agents" >&2; exit 1; }
+grep -q 'utilityModel: "ollama/qwen3' "$CFG" || { echo "FAIL: no ollama utility ref" >&2; exit 1; }
+if grep -q 'nanogpt' "$CFG"; then
+    echo "FAIL: nanogpt leaked into ollama-only config" >&2
+    exit 1
+fi
 if grep -q 'nanogpt/ollama\|ollama/ollama' "$CFG"; then
-    echo "FAIL: double-prefixed model ref in config" >&2; exit 1
+    echo "FAIL: double-prefixed model ref in config" >&2
+    exit 1
 fi
 
 # --- 2. Provider endpoint answers (OpenAI-compat shape) -------------------
