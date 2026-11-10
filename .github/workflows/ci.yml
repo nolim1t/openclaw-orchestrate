@@ -173,7 +173,6 @@ jobs:
       
       - name: Test Ollama configs
         run: |
-          set -euo pipefail
           OLLAMA_ONLY=1 OPENCLAW_STATE_DIR="${RUNNER_TEMP}/triad-ollama" ./scripts/setup-openclaw-triad.sh >/dev/null
           grep -q '"ollama"' "${RUNNER_TEMP}/triad-ollama/openclaw.json"
           grep -q 'ollama/qwen3:1.7b' "${RUNNER_TEMP}/triad-ollama/openclaw.json"
