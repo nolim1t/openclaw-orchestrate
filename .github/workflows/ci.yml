@@ -194,3 +194,80 @@ jobs:
         run: |
           cd "$OPENCLAW_STATE_DIR"
           docker compose --env-file docker.env build
+
+  # ---------------------------------------------------------------------
+  # Ollama-only smoke: tiny local model, no API keys, zero token spend.
+  # Proves the OLLAMA_ONLY provider path end-to-end: generation invariants,
+  # container ↔ host networking, live agent round-trip.
+  # ---------------------------------------------------------------------
+  ollama-smoke:
+    name: Ollama-only smoke (OLLAMA_ONLY=1)
+    runs-on: ubuntu-latest
+    needs: [generator-smoke, docker-build]
+    timeout-minutes: 20
+    env:
+      OPENCLAW_STATE_DIR: ${{ github.workspace }}/.ci-state/ollama-smoke
+      OPENCLAW_GATEWAY_TOKEN: ci-placeholder-token
+      AGENT_ROSTER: seer,guardian,sage
+      PERSONALITY_PRESET: default
+      OLLAMA_ONLY: "1"
+      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
+      OLLAMA_SCOUT_MODEL: qwen3:0.6b
+      OLLAMA_RISK_MODEL: qwen3:0.6b
+      OLLAMA_JUDGE_MODEL: qwen3:0.6b
+      OLLAMA_UTILITY_MODEL: qwen3:0.6b
+      # NB: no NANOGPT_API_KEY — proves the zero-dependency claim too.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Cache model blobs
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-models-qwen3-0.6b-v1
+
+      - name: Pull model + start server
+        run: |
+          ollama pull qwen3:0.6b
+          ollama serve &
+          sleep 3
+          curl -sf http://localhost:11434/api/tags > /dev/null
+
+      - name: Generate stack (ollama-only)
+        run: ./scripts/setup-openclaw-triad.sh --docker
+
+      - name: Assert ollama-only invariants
+        run: |
+          set -euo pipefail
+          CFG="$OPENCLAW_STATE_DIR/openclaw.json"
+          grep -q '"ollama"' "$CFG"
+          ! grep -q 'nanogpt/' "$CFG"
+          grep -q 'utilityModel: "ollama/qwen3:0.6b"' "$CFG"
+          # Judge stays read-only even in ollama mode — least privilege survives
+          grep -q 'tools: { allow: \["read", "message"\] }' "$CFG"
+
+      - name: Boot container
+        run: |
+          cd "$OPENCLAW_STATE_DIR"
+          docker compose --env-file docker.env up -d
+          sleep 20
+          docker compose --env-file docker.env ps
+          docker compose --env-file docker.env logs --tail 50
+
+      - name: Smoke agent round-trip
+        run: ./scripts/smoke-agent-loop.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose --env-file "$OPENCLAW_STATE_DIR/docker.env" \
+            -f "$OPENCLAW_STATE_DIR/docker-compose.yml" logs --tail 200 || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          cd "$OPENCLAW_STATE_DIR"
+          docker compose --env-file docker.env down -v || true
