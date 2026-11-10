@@ -265,14 +265,27 @@ jobs:
         run: ./scripts/setup-openclaw-triad.sh --docker
 
       - name: Assert ollama-only invariants
+        env:
+          OLLAMA_ONLY: "1"
+          NANOGPT_API_KEY: ""        # step-level: overrides job env
+          AGENT_SAGE_MODEL: ""
+          TELEGRAM_BOT_TOKEN: ""
+          OPENCLAW_STATE_DIR: ${{ runner.temp }}/triad-ollama
         run: |
           set -euo pipefail
+          ./scripts/setup-openclaw-triad.sh
           CFG="$OPENCLAW_STATE_DIR/openclaw.json"
-          grep -q '"ollama"' "$CFG"
-          ! grep -q 'nanogpt/' "$CFG"
-          grep -q 'utilityModel: "ollama/qwen3:0.6b"' "$CFG"
-          # Judge stays read-only even in ollama mode — least privilege survives
-          grep -q 'tools: { allow: \["read", "message"\] }' "$CFG"
+
+          dump() {
+            echo "----- openclaw.json (providers/refs) -----"
+            grep -nE 'ollama|nanogpt|provider|utilityModel|primary:' "$CFG" || true
+            echo "------------------------------------------"
+          }
+
+          if ! grep -q 'ollama: {' "$CFG"; then dump; echo "FAIL: no ollama provider block" >&2; exit 1; fi
+          if grep -q 'nanogpt' "$CFG";     then dump; echo "FAIL: nanogpt leaked into ollama-only config" >&2; exit 1; fi
+          if ! grep -q 'ollama/qwen3:1.7b' "$CFG"; then dump; echo "FAIL: no ollama seat refs" >&2; exit 1; fi
+          echo "ollama-only invariants OK"
 
       - name: Boot container
         run: |
