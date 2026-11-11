@@ -267,19 +267,21 @@ docker-down:
 # =============================================================================
 
 ollama-init:
-	@echo "🦙 Seeding embedded Ollama models..."
-	@test -f "$(COMPOSE_FILE)" || { echo "❌ No compose file. Run 'make setup' first."; exit 1; }
-	@grep -q 'container_name: openclaw-ollama' "$(COMPOSE_FILE)" 2>/dev/null \
-		|| { echo "ℹ  No embedded ollama service (OLLAMA_EMBED=0) — nothing to do."; exit 0; }
-	
-	@cd $(OPENCLAW_STATE_DIR) && docker compose --env-file $(COMPOSE_ENV) exec -T ollama \
-		sh -c 'for m in qwen3:0.6b qwen3:1.7b; do ollama pull "$$m"; done'
-	@cd $(OPENCLAW_STATE_DIR) && docker compose --env-file $(COMPOSE_ENV) exec -T ollama ollama list
-	@docker exec $(CONTAINER_NAME) node -e \
+	@set -euo pipefail; \
+	test -f "$(COMPOSE_FILE)" || { echo "❌ No compose file. Run 'make setup' first."; exit 1; }; \
+	if ! grep -q 'container_name: openclaw-ollama' "$(COMPOSE_FILE)"; then \
+		echo "ℹ  No embedded ollama service (OLLAMA_EMBED=0) — nothing to do."; \
+		exit 0; \
+	fi; \
+	echo "🦙 Seeding embedded Ollama models..."; \
+	cd $(OPENCLAW_STATE_DIR) && docker compose --env-file $(COMPOSE_ENV) exec -T ollama \
+		sh -c 'for m in qwen3:0.6b qwen3:1.7b; do ollama pull "$$m"; done'; \
+	docker compose --env-file $(COMPOSE_ENV) exec -T ollama ollama list; \
+	docker exec $(CONTAINER_NAME) node -e \
 		"fetch('http://ollama:11434/api/tags').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))" \
 		&& echo "   ✓ gateway -> ollama reachable on compose network" \
-		|| { echo "   ⚠ gateway cannot reach http://ollama:11434 — check: docker compose ps + logs"; exit 1; }
-	@echo "✓ Ollama models seeded."
+		|| { echo "   ⚠ gateway cannot reach ollama — check: docker compose ps + logs"; exit 1; }; \
+	echo "✓ Ollama models seeded."
 
 # =============================================================================
 # TELEGRAM — channel registration happens AT RUNTIME, once, after the
