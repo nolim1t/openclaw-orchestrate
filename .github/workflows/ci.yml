@@ -298,6 +298,8 @@ jobs:
 
       - name: Smoke agent round-trip
         run: ./scripts/smoke-agent-loop.sh
+        env:
+          SMOKE_TIMEOUT: "300"
 
       - name: Dump logs on failure and diagnose
         if: failure()
