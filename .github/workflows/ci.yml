@@ -262,6 +262,18 @@ jobs:
           ollama pull qwen3:0.6b
           ollama list
 
+      - name: Assert container-view reachability
+        run: |
+          set -euo pipefail
+          # The IP containers resolve host.docker.internal to (host-gateway)
+          HOST_IP="$(ip -4 route get 1.1.1.1 | grep -oE 'src [0-9.]+' | awk '{print $2}')"
+          curl -sf --max-time 5 "http://${HOST_IP}:11434/api/tags" > /dev/null || {
+            echo "ollama is up on localhost but NOT reachable on ${HOST_IP}:11434" >&2
+            echo "(bound to loopback only — containers will get ECONNREFUSED)" >&2
+            cat /tmp/ollama-serve.log >&2 || true
+            exit 1
+          }
+      
       - name: Generate stack (ollama-only)
         run: ./scripts/setup-openclaw-triad.sh --docker
 
