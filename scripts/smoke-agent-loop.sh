@@ -17,25 +17,47 @@ MESSAGE="${SMOKE_MESSAGE:-State your role in one short line.}"
 TIMEOUT_S="${SMOKE_TIMEOUT:-120}"
 
 # --- 1. Static asserts on the generated config ---------------------------
+# NB: the runtime normalizes openclaw.json at boot (quotes keys), so
+# key-shape greps must accept BOTH dialects — pre-boot and post-boot.
 test -f "$CFG"
-grep -q 'ollama: {' "$CFG" || { echo "FAIL: no ollama provider in config" >&2; exit 1; }
+grep -Eq '"?ollama"?:[ ]*\{' "$CFG" || { echo "FAIL: no ollama provider in config" >&2; exit 1; }
 grep -q 'primary: "ollama/qwen3' "$CFG" || { echo "FAIL: no ollama refs in agents" >&2; exit 1; }
 grep -q 'utilityModel: "ollama/qwen3' "$CFG" || { echo "FAIL: no ollama utility ref" >&2; exit 1; }
 if grep -q 'nanogpt' "$CFG"; then
     echo "FAIL: nanogpt leaked into ollama-only config" >&2
     exit 1
 fi
-if grep -q 'nanogpt/ollama\|ollama/ollama' "$CFG"; then
+if grep -Eq 'nanogpt/ollama|ollama/ollama' "$CFG"; then
     echo "FAIL: double-prefixed model ref in config" >&2
     exit 1
 fi
-
 # --- 2. Provider endpoint answers (OpenAI-compat shape) -------------------
-HOST_BASE="${OLLAMA_HOST_BASE:-http://localhost:11434/v1}"
-resp="$(curl -sf --max-time 10 "${HOST_BASE}/chat/completions" \
-    -H 'Content-Type: application/json' \
-    -d "{\"model\": \"${SMOKE_MODEL:-qwen3:0.6b}\", \"messages\": [{\"role\": \"user\", \"content\": \"reply with the single word: ok\"}], \"stream\": false}")"
-echo "$resp" | grep -q '"choices"' || { echo "FAIL: no choices in response" >&2; exit 1; }
+# Embedded topology: NO published ports — probe from INSIDE the triad
+# container against compose DNS (node fetch; the image has no curl).
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx openclaw-triad; then
+    timeout "${SMOKE_TIMEOUT:-120}" docker exec openclaw-triad node -e '
+        fetch("http://ollama:11434/v1/chat/completions", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            model: process.argv[1],
+            messages: [{role: "user", content: "reply with the single word: ok"}],
+            stream: false
+          })
+        }).then(async r => {
+          const t = await r.text();
+          process.exit(t.includes("\u0022choices\u0022") ? 0 : 1);
+        }).catch(() => process.exit(1));
+    ' "${SMOKE_MODEL:-qwen3:0.6b}" || { echo "FAIL: embedded ollama probe failed" >&2; exit 1; }
+    echo "   [ok] embedded provider answered from inside the network"
+else
+    # Host-attached fallback: curl the host-published daemon as before.
+    resp="$(curl -sf --max-time 10 "${OLLAMA_HOST_BASE:-http://localhost:11434/v1}/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\": \"${SMOKE_MODEL:-qwen3:0.6b}\", \"messages\": [{\"role\": \"user\", \"content\": \"reply with the single word: ok\"}], \"stream\": false}")" \
+        || { echo "FAIL: no response from provider" >&2; exit 1; }
+    echo "$resp" | grep -q '"choices"' || { echo "FAIL: no choices in response" >&2; exit 1; }
+fi
 
 # --- 3. Agent round-trip ---------------------------------------------------
 # In-container invocation (the same path Telegram/plugins use at runtime).
