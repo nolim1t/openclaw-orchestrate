@@ -250,7 +250,7 @@ jobs:
           set -euo pipefail
           CFG="$OPENCLAW_STATE_DIR/openclaw.json"
           CMP="$OPENCLAW_STATE_DIR/docker-compose.yml"
-          grep -q '"ollama"' "$CFG"
+          grep -q 'ollama: {' "$CFG" 
           ! grep -q 'nanogpt/' "$CFG"
           grep -q 'utilityModel: "ollama/qwen3:0.6b"' "$CFG"
           # embedded service + startup ordering present:
@@ -279,6 +279,15 @@ jobs:
           docker compose --env-file docker.env exec -T ollama ollama list
           docker compose --env-file docker.env ps
 
+      - name: Seed ollama provider auth (dummy key — server ignores it)
+        run: |
+          set -euo pipefail
+          for a in $(echo "$AGENT_ROSTER" | tr ',' ' '); do
+            echo ollama-local | docker exec -i openclaw-triad \
+              openclaw models auth paste-api-key --provider ollama --agent "$a"
+            echo "   seeded: $a"
+          done
+          
       - name: Smoke agent round-trip
         run: ./scripts/smoke-agent-loop.sh
 
