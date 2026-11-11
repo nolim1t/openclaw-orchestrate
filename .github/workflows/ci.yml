@@ -243,12 +243,22 @@ jobs:
           path: ~/.ollama
           key: ollama-models-qwen3-0.6b-v1
 
-      - name: Start server + pull model
+      - name: Start server (0.0.0.0 bind, race-free) + pull model
         run: |
-          # Kill any auto-started daemon (it binds loopback only); restart
-          # bound to 0.0.0.0 so containers can reach it via host-gateway.
-          pkill -f 'ollama serve' 2>/dev/null || true
-          sleep 1
+          # Runner image auto-starts a loopback-bound systemd daemon; containers
+          # need the gateway-IP bind. Stop the unit, WAIT for the port to be
+          # truly free, then start our own externally-bound daemon.
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo pkill -x ollama 2>/dev/null || true
+          for i in $(seq 1 30); do
+            ss -ltn | grep -q ':11434' || break
+            sleep 1
+          done
+          ss -ltn | grep -q ':11434' && {
+            echo "port 11434 still occupied after stop — dumping who:" >&2
+            ss -ltnp 'sport = :11434' >&2 || true
+            exit 1
+          }
           OLLAMA_HOST=0.0.0.0:11434 ollama serve > /tmp/ollama-serve.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags > /dev/null && break
@@ -261,6 +271,8 @@ jobs:
           }
           ollama pull qwen3:0.6b
           ollama list
+        env:
+          OLLAMA_HOST: 0.0.0.0:11434
 
       - name: Assert container-view reachability
         run: |
