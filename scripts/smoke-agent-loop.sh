@@ -21,8 +21,9 @@ TIMEOUT_S="${SMOKE_TIMEOUT:-120}"
 # key-shape greps must accept BOTH dialects — pre-boot and post-boot.
 test -f "$CFG"
 grep -Eq '"?ollama"?:[ ]*\{' "$CFG" || { echo "FAIL: no ollama provider in config" >&2; exit 1; }
-grep -q 'primary: "ollama/qwen3' "$CFG" || { echo "FAIL: no ollama refs in agents" >&2; exit 1; }
-grep -q 'utilityModel: "ollama/qwen3' "$CFG" || { echo "FAIL: no ollama utility ref" >&2; exit 1; }
+grep -Eq '"?primary"?:[ ]*"ollama/qwen3' "$CFG" || { echo "FAIL: no ollama refs in agents" >&2; exit 1; }
+grep -Eq '"?utilityModel"?:[ ]*"ollama/qwen3' "$CFG" || { echo "FAIL: no ollama utility ref" >&2; exit 1; }
+
 if grep -q 'nanogpt' "$CFG"; then
     echo "FAIL: nanogpt leaked into ollama-only config" >&2
     exit 1
