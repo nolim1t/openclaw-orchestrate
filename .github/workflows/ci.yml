@@ -214,8 +214,13 @@ jobs:
   # Proves the OLLAMA_ONLY provider path end-to-end: generation invariants,
   # container ↔ host networking, live agent round-trip.
   # ---------------------------------------------------------------------
+  # ---------------------------------------------------------------------
+  # Ollama-only smoke: EMBEDDED topology — the compose service is the
+  # model host, so there is no host install/bind/race step at all.
+  # Zero API keys: proves the zero-dependency testnet story in CI.
+  # ---------------------------------------------------------------------
   ollama-smoke:
-    name: Ollama-only smoke (OLLAMA_ONLY=1)
+    name: Ollama-only smoke (embedded OLLAMA_ONLY=1)
     runs-on: ubuntu-latest
     needs: [generator-smoke, docker-build]
     timeout-minutes: 20
@@ -225,105 +230,108 @@ jobs:
       AGENT_ROSTER: seer,guardian,sage
       PERSONALITY_PRESET: default
       OLLAMA_ONLY: "1"
-      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
+      OLLAMA_EMBED: "1"
+      # generator default flips to compose DNS; explicit for clarity:
+      OLLAMA_BASE_URL: http://ollama:11434/v1
       OLLAMA_SCOUT_MODEL: qwen3:0.6b
       OLLAMA_RISK_MODEL: qwen3:0.6b
       OLLAMA_JUDGE_MODEL: qwen3:0.6b
       OLLAMA_UTILITY_MODEL: qwen3:0.6b
-      # NB: no NANOGPT_API_KEY — proves the zero-dependency claim too.
+      OLLAMA_MEM_LIMIT: 2g
+      # NB: no NANOGPT_API_KEY — zero cloud dependency by design.
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
-
-      - name: Cache model blobs
-        uses: actions/cache@v4
-        with:
-          path: ~/.ollama
-          key: ollama-models-qwen3-0.6b-v1
-
-      - name: Start server (0.0.0.0 bind, race-free) + pull model
-        run: |
-          # Runner image auto-starts a loopback-bound systemd daemon; containers
-          # need the gateway-IP bind. Stop the unit, WAIT for the port to be
-          # truly free, then start our own externally-bound daemon.
-          sudo systemctl stop ollama 2>/dev/null || true
-          sudo pkill -x ollama 2>/dev/null || true
-          for i in $(seq 1 30); do
-            ss -ltn | grep -q ':11434' || break
-            sleep 1
-          done
-          ss -ltn | grep -q ':11434' && {
-            echo "port 11434 still occupied after stop — dumping who:" >&2
-            ss -ltnp 'sport = :11434' >&2 || true
-            exit 1
-          }
-          OLLAMA_HOST=0.0.0.0:11434 ollama serve > /tmp/ollama-serve.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:11434/api/tags > /dev/null && break
-            sleep 1
-          done
-          curl -sf http://localhost:11434/api/tags > /dev/null || {
-            echo "ollama server did not come up; log:" >&2
-            cat /tmp/ollama-serve.log >&2 || true
-            exit 1
-          }
-          ollama pull qwen3:0.6b
-          ollama list
-        env:
-          OLLAMA_HOST: 0.0.0.0:11434
-
-      - name: Assert container-view reachability
-        run: |
-          set -euo pipefail
-          # The IP containers resolve host.docker.internal to (host-gateway)
-          HOST_IP="$(ip -4 route get 1.1.1.1 | grep -oE 'src [0-9.]+' | awk '{print $2}')"
-          curl -sf --max-time 5 "http://${HOST_IP}:11434/api/tags" > /dev/null || {
-            echo "ollama is up on localhost but NOT reachable on ${HOST_IP}:11434" >&2
-            echo "(bound to loopback only — containers will get ECONNREFUSED)" >&2
-            cat /tmp/ollama-serve.log >&2 || true
-            exit 1
-          }
-      
-      - name: Generate stack (ollama-only)
+      - name: Generate stack (ollama-only, embedded)
         run: ./scripts/setup-openclaw-triad.sh --docker
 
       - name: Assert ollama-only invariants
         run: |
           set -euo pipefail
           CFG="$OPENCLAW_STATE_DIR/openclaw.json"
-          grep -q 'ollama: {' "$CFG"                                  # line 6: provider block, unquoted key
-          ! grep -q 'nanogpt' "$CFG"                                  # zero cloud refs (broaden from 'nanogpt/': catches the block too)
-          grep -q 'primary: "ollama/qwen3:0.6b"' "$CFG"               # seat refs, router spelling
-          grep -q 'utilityModel: "ollama/qwen3:0.6b"' "$CFG"          # utility seat
-          # Judge stays read-only even in ollama mode — least privilege survives
+          CMP="$OPENCLAW_STATE_DIR/docker-compose.yml"
+          grep -q 'ollama: {' "$CFG" 
+          ! grep -q 'nanogpt/' "$CFG"
+          grep -q 'utilityModel: "ollama/qwen3:0.6b"' "$CFG"
+          # embedded service + startup ordering present:
+          grep -q 'container_name: openclaw-ollama' "$CMP"
+          grep -q 'condition: service_healthy' "$CMP"
+          grep -q 'http://ollama:11434/v1' "$CFG"
+          # judge stays read-only even in ollama mode — least privilege survives
           grep -q 'tools: { allow: \["read", "message"\] }' "$CFG"
 
-      - name: Boot container
+      - name: Compose file parses
+        run: >-
+          docker compose --env-file "$OPENCLAW_STATE_DIR/docker.env"
+          -f "$OPENCLAW_STATE_DIR/docker-compose.yml" config -q
+
+      - name: Boot stack (waits on ollama health gate)
         run: |
           cd "$OPENCLAW_STATE_DIR"
           docker compose --env-file docker.env up -d
-          sleep 20
+          # up -d returns when containers START; the depends_on health gate
+          # ordered startup, but seeding can race the first load — retry.
+          for i in $(seq 1 30); do
+            docker compose --env-file docker.env exec -T ollama \
+              ollama pull qwen3:0.6b && break
+            sleep 2
+          done
+          docker compose --env-file docker.env exec -T ollama ollama list
           docker compose --env-file docker.env ps
-          docker compose --env-file docker.env logs --tail 50
 
+      - name: Seed ollama provider auth (dummy key — server ignores it)
+        run: |
+          set -euo pipefail
+          for a in $(echo "$AGENT_ROSTER" | tr ',' ' '); do
+            echo ollama-local | docker exec -i openclaw-triad \
+              openclaw models auth paste-api-key --provider ollama --agent "$a"
+            echo "   seeded: $a"
+          done
+          
       - name: Smoke agent round-trip
         run: ./scripts/smoke-agent-loop.sh
         env:
           SMOKE_TIMEOUT: "300"
 
-      - name: Dump logs on failure and diagnose
+      - name: Embedded provider probe (triad → compose DNS → ollama)
+        run: |
+          set -euo pipefail
+          # The production path: agent container → compose DNS → ollama.
+          # No published ports, so this MUST run from inside the network.
+          timeout 120 docker exec openclaw-triad node -e '
+            fetch("http://ollama:11434/v1/chat/completions", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({
+                model: process.argv[1],
+                messages: [{role: "user", content: "reply with the single word: ok"}],
+                stream: false
+              })
+            }).then(async r => {
+              const t = await r.text();
+              process.exit(t.includes("\u0022choices\u0022") ? 0 : 1);
+            }).catch(() => process.exit(1));
+          ' "${OLLAMA_SCOUT_MODEL}" || { echo "FAIL: embedded probe — check compose ps + logs" >&2; exit 1; }
+          echo "[ok] provider answered from inside the network"
+
+      - name: Agent round-trip (first committee inference)
+        run: |
+          set -euo pipefail
+          timeout "${SMOKE_TIMEOUT}" docker exec openclaw-triad \
+            openclaw agent --agent seer \
+              --message "State your role in one short line."
+        env:
+          SMOKE_TIMEOUT: "300"
+      
+      - name: Dump logs on failure
         if: failure()
         run: |
           docker compose --env-file "$OPENCLAW_STATE_DIR/docker.env" \
             -f "$OPENCLAW_STATE_DIR/docker-compose.yml" logs --tail 200 || true
-          echo "--- smoke: container -> host network probe ---"
-          docker exec openclaw-triad getent hosts host.docker.internal || { echo "FAIL: host.docker.internal does not resolve in container" >&2; exit 1; }
-
 
       - name: Teardown
         if: always()
         run: |
           cd "$OPENCLAW_STATE_DIR"
           docker compose --env-file docker.env down -v || true
+

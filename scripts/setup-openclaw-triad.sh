@@ -14,6 +14,17 @@
 #     (catches subscription mismatches BEFORE boot, not during transport).
 #   - Seeded .env documents all model knobs with a DeepSeek/GLM example.
 #
+# CHANGELOG v3.4 — Ollama embedded service (OLLAMA_EMBED=1)
+#   - Generator emits an `ollama` service inside docker-compose.yml when
+#     the ollama provider is wired AND OLLAMA_EMBED=1: named volume for
+#     models, NO published ports, own mem ceiling, healthcheck, and
+#     depends_on: service_healthy on the gateway (startup order is
+#     structural, not a sleep-race).
+#   - Provider baseUrl default flips to compose DNS (http://ollama:11434/v1)
+#     in embedded mode; host-attached default unchanged.
+#   - Preflight probes the host only when a HOST ollama is expected.
+#   - Image is pinned via OLLAMA_IMAGE (bump deliberately, like BASE_IMAGE).
+#
 # CHANGELOG v3.2 (vs v3.1) — schema-valid config from birth
 #   - Agent entries carry NO theme/role keys (the runtime schema rejected
 #     them 2026-11-07). Personas live solely in each agent AGENTS.md.
@@ -179,7 +190,26 @@ USE_WALLET=false; if [[ -n "$WALLET_TYPE" ]]; then USE_WALLET=true; fi
 # --- Ollama (local LLM; only consumed when OLLAMA_ONLY=1) ------------------
 # Container-view URL by default; the generation-time preflight separately
 # probes the host view (localhost). See ollama_preflight().
-OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}"
+
+# --- Ollama (local LLM; consumed when OLLAMA_ONLY=1) ------------------------
+OLLAMA_EMBED="${OLLAMA_EMBED:-0}"
+OLLAMA_IMAGE="${OLLAMA_IMAGE:-ollama/ollama:0.40.10}"
+OLLAMA_MEM_LIMIT="${OLLAMA_MEM_LIMIT:-2g}"
+if [[ "$OLLAMA_EMBED" == "1" ]]; then
+    # Embedded: compose-network DNS name (service ships inside the stack).
+    OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://ollama:11434/v1}"
+else
+    # Host-attached: containers dial the host daemon via host-gateway.
+    OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}"
+fi
+OLLAMA_SCOUT_MODEL="${OLLAMA_SCOUT_MODEL:-qwen3:1.7b}"
+OLLAMA_RISK_MODEL="${OLLAMA_RISK_MODEL:-qwen3:1.7b}"
+OLLAMA_JUDGE_MODEL="${OLLAMA_JUDGE_MODEL:-qwen3:1.7b}"
+OLLAMA_UTILITY_MODEL="${OLLAMA_UTILITY_MODEL:-qwen3:0.6b}"
+
+is_ollama_active() {  # is the ollama provider wired? (seam for OLLAMA_UTILITY=1)
+    is_ollama_only
+}
 OLLAMA_SCOUT_MODEL="${OLLAMA_SCOUT_MODEL:-qwen3:1.7b}"
 OLLAMA_RISK_MODEL="${OLLAMA_RISK_MODEL:-qwen3:1.7b}"
 OLLAMA_JUDGE_MODEL="${OLLAMA_JUDGE_MODEL:-qwen3:1.7b}"
@@ -550,6 +580,13 @@ ollama_preflight() {
     # Container-side reachability is checked at boot time instead (see §8).
     # Advisory-only: generation must succeed without an Ollama server.
     is_ollama_only || return 0
+    if [[ "$OLLAMA_EMBED" == "1" ]]; then
+        # Server does not exist yet at generation time — it boots with the
+        # compose stack and is verified by `make ollama-init` post-boot.
+        echo "   [i] OLLAMA_EMBED=1: ollama ships inside compose; host preflight skipped."
+        echo "       After boot:  make ollama-init   (pulls seat models)"
+        return 0
+    fi
     local tags _m
     tags="$(curl -sf --max-time 3 http://localhost:11434/api/tags 2>/dev/null || true)"
     if [[ -z "$tags" ]]; then
@@ -886,6 +923,62 @@ services:
       retries: 3
       start_period: 60s
 EOCC
+
+    # --- v3.4: optional embedded ollama service (compose-DNS only) ----------
+    # Runs AFTER the EOCC heredoc closes so quoted-heredoc ${VARS} in the
+    # base compose stay literal; the new ${OLLAMA_*} refs interpolate at
+    # compose time from docker.env (step 3). No published ports by design —
+    # DNS name `ollama`, compose network only.
+    if [[ "$OLLAMA_EMBED" == "1" ]] && is_ollama_active; then
+        # 1) Startup ordering: gateway depends_on the ollama health gate
+        #    (structural, not a sleep-race). At this point the file contains
+        #    ONLY openclaw-triad, so the first restart: line is ours.
+        awk '
+            /^    restart: unless-stopped$/ && !depdone {
+                print
+                print "    depends_on:"
+                print "      ollama:"
+                print "        condition: service_healthy"
+                depdone = 1
+                next
+            }
+            { print }
+            END { exit depdone ? 0 : 1 }
+        ' "${STATE_DIR}/docker-compose.yml" > "${STATE_DIR}/docker-compose.yml.new" \
+            && mv "${STATE_DIR}/docker-compose.yml.new" "${STATE_DIR}/docker-compose.yml"
+
+        # 2) The model-host service. Appending at 2-space indent continues
+        #    the services: mapping — valid YAML, no mid-file surgery needed.
+        cat << 'EOOL' >> "${STATE_DIR}/docker-compose.yml"
+  ollama:
+    image: ${OLLAMA_IMAGE}
+    container_name: openclaw-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    mem_limit: ${OLLAMA_MEM_LIMIT}
+    healthcheck:
+      # Use the ollama CLI, NOT curl — the official image does not ship
+      # curl, and 'ollama list' fails when the local server is down.
+      test: ["CMD-SHELL", "ollama list > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  ollama-models:
+EOOL
+
+        # 3) Interpolation vars for the refs above (docker.env — no secrets).
+        cat >> "${STATE_DIR}/docker.env" << EOOE
+
+# ---- Embedded ollama service (v3.4) — interpolation only ----
+OLLAMA_IMAGE=${OLLAMA_IMAGE}
+OLLAMA_MEM_LIMIT=${OLLAMA_MEM_LIMIT}
+EOOE
+        echo "   [ok] Embedded ollama service written (DNS: ollama, health-gated startup)"
+    fi
 
     echo "   [ok] Docker trio written: Dockerfile + docker-compose.yml + docker.env (mem_limit=${CONTAINER_MEM_LIMIT}, .tmp tmpfs + TMPDIR, no config-file mount, image-side guard)"
 else
