@@ -290,7 +290,39 @@ jobs:
           
       - name: Smoke agent round-trip
         run: ./scripts/smoke-agent-loop.sh
+        env:
+          SMOKE_TIMEOUT: "300"
 
+      - name: Embedded provider probe (triad → compose DNS → ollama)
+        run: |
+          set -euo pipefail
+          # The production path: agent container → compose DNS → ollama.
+          # No published ports, so this MUST run from inside the network.
+          timeout 120 docker exec openclaw-triad node -e '
+            fetch("http://ollama:11434/v1/chat/completions", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({
+                model: process.argv[1],
+                messages: [{role: "user", content: "reply with the single word: ok"}],
+                stream: false
+              })
+            }).then(async r => {
+              const t = await r.text();
+              process.exit(t.includes("\u0022choices\u0022") ? 0 : 1);
+            }).catch(() => process.exit(1));
+          ' "${OLLAMA_SCOUT_MODEL}" || { echo "FAIL: embedded probe — check compose ps + logs" >&2; exit 1; }
+          echo "[ok] provider answered from inside the network"
+
+      - name: Agent round-trip (first committee inference)
+        run: |
+          set -euo pipefail
+          timeout "${SMOKE_TIMEOUT}" docker exec openclaw-triad \
+            openclaw agent --agent seer \
+              --message "State your role in one short line."
+        env:
+          SMOKE_TIMEOUT: "300"
+      
       - name: Dump logs on failure
         if: failure()
         run: |
